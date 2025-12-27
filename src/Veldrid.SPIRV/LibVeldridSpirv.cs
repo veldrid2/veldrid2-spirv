@@ -1,749 +1,843 @@
-// veldrid-spirv.cpp : Defines the entry point for the console application.
-//
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using Silk.NET.Shaderc;
+using Silk.NET.SPIRV;
+using Silk.NET.SPIRV.Cross;
 
-#include "libveldrid-spirv.hpp"
-#include "InteropStructs.hpp"
-#include <fstream>
-#include "spirv_hlsl.hpp"
-#include "spirv_glsl.hpp"
-#include "spirv_msl.hpp"
-#include <map>
-#include <sstream>
-#include "shaderc.hpp"
-#include <iostream>
+namespace Veldrid.SPIRV;
 
-using namespace spirv_cross;
+using CrossCompiler = Silk.NET.SPIRV.Cross.Compiler;
+using ShaderCompiler = Silk.NET.Shaderc.Compiler;
 
-namespace Veldrid
-{
-void ReflectVertexInfo(const Compiler& compiler, const ShaderResources& resources, ReflectionInfo& info);
-
-struct BindingInfo
-{
-    uint32_t Set;
-    uint32_t Binding;
-};
-
-bool operator<(const BindingInfo &a, const BindingInfo &b)
-{
-    return a.Set < b.Set ||
-           (a.Set == b.Set && a.Binding < b.Binding);
-}
+readonly record struct BindingInfo(uint Set, uint Binding);
 
 struct ResourceInfo
 {
-    std::string Name;
-    ResourceKind Kind;
-    std::uint32_t IDs[2]; // 0 == VS/CS, 1 == FS
-};
+    public InteropArray<byte> Name;
+    public ResourceKind Kind;
+    public IdArray IDs; // 0 == VS/CS, 1 == FS
 
-ResourceKind ClassifyResource(const Compiler *compiler, const Resource &resource, bool image, bool storage)
-{
-    SPIRType type = compiler->get_type(resource.type_id);
-    uint32_t nonWritable = compiler->get_decoration(resource.id, spv::Decoration::DecorationNonWritable);
-    switch (type.basetype)
+    [InlineArray(2)]
+    public struct IdArray
     {
-    case SPIRType::BaseType::Struct:
-        if (storage)
+        private uint _e0;
+    }
+}
+
+internal static unsafe class LibVeldridSpirv
+{
+    private static readonly Cross api1 = Cross.GetApi();
+    private static readonly Shaderc api2 = Shaderc.GetApi();
+
+    private static ResourceKind ClassifyResource(CrossCompiler* compiler, in ReflectedResource resource, bool image, bool storage)
+    {
+        CrossType* type = api1.CompilerGetTypeHandle(compiler, resource.TypeId);
+        
+        // TODO: what's this for?
+        uint nonWritable = api1.CompilerGetDecoration(compiler, resource.Id, Decoration.NonWritable);
+
+        switch (api1.TypeGetBasetype(type))
         {
-            auto bufferBlockFlags = compiler->get_buffer_block_flags(resource.id);
-            if (bufferBlockFlags.get(spv::Decoration::DecorationNonWritable))
+            case Basetype.Struct:
+                if (storage)
+                {
+                    Decoration* decors;
+                    nuint num_decors;
+                    api1.CompilerGetBufferBlockDecorations(compiler, resource.Id, &decors, &num_decors);
+
+                    for (nuint i = 0; i < num_decors; i++)
+                    {
+                        if (decors[i] == Decoration.NonWritable)
+                        {
+                            return ResourceKind.StructuredBufferReadOnly;
+                        }
+                    }
+                    return ResourceKind.StructuredBufferReadWrite;
+                }
+                else
+                {
+                    return ResourceKind.UniformBuffer;
+                }
+
+            case Basetype.Image:
+                return storage ? ResourceKind.TextureReadWrite : ResourceKind.TextureReadOnly;
+
+            case Basetype.Sampler:
+                return ResourceKind.Sampler;
+
+            default:
+                throw new Exception("Unhandled SPIR-V data type.");
+        }
+    }
+
+    private static void AddResources(
+        Resources* resources,
+        ResourceType type,
+        CrossCompiler* compiler,
+        Dictionary<BindingInfo, ResourceInfo> allResources,
+        int idIndex,
+        bool normalizeResourceNames,
+        bool image = false,
+        bool storage = false)
+    {
+        ReflectedResource* resourceList;
+        nuint resource_size;
+        api1.ResourcesGetResourceListForType(resources, type, &resourceList, &resource_size);
+
+        for (nuint i = 0; i < resource_size; i++)
+        {
+            ReflectedResource res = resourceList[i];
+            ResourceKind kind = ClassifyResource(compiler, res, image, storage);
+            BindingInfo bi = new(
+                api1.CompilerGetDecoration(compiler, res.Id, Decoration.DescriptorSet),
+                api1.CompilerGetDecoration(compiler, res.Id, Decoration.Binding)
+            );
+
+            ResourceInfo ri = new();
+            if (normalizeResourceNames)
             {
-                return StorageBufferReadOnly;
+                InteropArray<byte> name = InteropArray.ToUtf8($"vdspv_{bi.Set}_{bi.Binding}");
+                if (kind == ResourceKind.UniformBuffer)
+                {
+                    api1.CompilerSetName(compiler, res.BaseTypeId, name.Data);
+                }
+                else
+                {
+                    api1.CompilerSetName(compiler, res.Id, name.Data);
+                }
+                ri.Name = name;
             }
             else
             {
-                return StorageBufferReadWrite;
-            }
-        }
-        else
-        {
-            return UniformBuffer;
-        }
-    case SPIRType::BaseType::Image:
-        return storage ? StorageImage : SampledImage;
-    case SPIRType::BaseType::Sampler:
-        return ResourceKind::Sampler;
-    default:
-        throw std::runtime_error("Unhandled SPIR-V data type.");
-    }
-}
-
-void AddResources(
-    spirv_cross::SmallVector<spirv_cross::Resource> &resources,
-    spirv_cross::Compiler *compiler,
-    std::map<BindingInfo, ResourceInfo> &allResources,
-    const uint32_t idIndex,
-    bool normalizeResourceNames,
-    bool image = false,
-    bool storage = false)
-{
-    for (auto &resource : resources)
-    {
-        ResourceKind kind = ClassifyResource(compiler, resource, image, storage);
-        BindingInfo bi;
-        bi.Set = compiler->get_decoration(resource.id, spv::Decoration::DecorationDescriptorSet);
-        bi.Binding = compiler->get_decoration(resource.id, spv::Decoration::DecorationBinding);
-
-        ResourceInfo ri = {};
-        if (normalizeResourceNames)
-        {
-            std::string name = "vdspv_" + std::to_string(bi.Set) + "_" + std::to_string(bi.Binding);
-            if (kind == ResourceKind::UniformBuffer)
-            {
-                compiler->set_name(resource.base_type_id, name);
-            }
-            else
-            {
-                compiler->set_name(resource.id, name);
-            }
-            ri.Name = name;
-        }
-        else
-        {
-            ri.Name = resource.name;
-        }
-
-        ri.IDs[idIndex] = resource.id;
-        ri.Kind = kind;
-
-        auto pair = allResources.insert(std::pair<BindingInfo, ResourceInfo>(bi, ri));
-        if (!pair.second) // Insertion failed; element already exists.
-        {
-            if (pair.first->second.IDs[idIndex] != 0)
-            {
-                std::stringstream msg;
-                msg << "The same binding slot ";
-                msg << "(" << std::to_string(bi.Set) << ", " << std::to_string(bi.Binding) << ") ";
-                msg << "was used by multiple distinct resources. First resource: " << pair.first->second.Name << ". Second resource: " << ri.Name;
-                throw std::runtime_error(msg.str());
+                ri.Name = InteropArray.FromNullTerminated(res.Name).Clone();
             }
 
-            pair.first->second.IDs[idIndex] = resource.id;
-            if (pair.first->second.Kind != kind)
+            ri.IDs[idIndex] = res.Id;
+            ri.Kind = kind;
+
+            if (allResources.TryAdd(bi, ri))
             {
-                std::stringstream msg;
-                msg << "The same binding slot ";
-                msg << "(" << std::to_string(bi.Set) << ", " << std::to_string(bi.Binding) << ") ";
-                msg << "was used by multiple resources with incompatible types: ";
-                msg << "\"" << pair.first->second.Kind << "\" and ";
-                msg << "\"" << kind << "\".";
-                throw std::runtime_error(msg.str());
+                continue;
+            }
+            ref ResourceInfo actualRi = ref CollectionsMarshal.GetValueRefOrNullRef(allResources, bi);
+
+            if (actualRi.IDs[idIndex] != 0)
+            {
+                string msg = $"The same binding slot ({bi.Set}, {bi.Binding}) was used by multiple distinct resources. First resource: {InteropArray.ToString(actualRi.Name)}. Second resource: {InteropArray.ToString(ri.Name)}";
+                throw new Exception(msg);
+            }
+
+            actualRi.IDs[idIndex] = res.Id;
+            if (actualRi.Kind != kind)
+            {
+                string msg = $"The same binding slot ({bi.Set}, {bi.Binding}) was used by multiple resources with incompatible types: \"{actualRi.Kind}\" and \"{kind}\".";
+                throw new Exception(msg);
             }
         }
     }
-}
 
-uint32_t GetResourceIndex(
-    CrossCompileTarget target,
-    ResourceKind resourceKind,
-    uint32_t &bufferIndex,
-    uint32_t &textureIndex,
-    uint32_t &uavIndex,
-    uint32_t &samplerIndex)
-{
-    switch (resourceKind)
+
+    private static uint GetResourceIndex(
+        CrossCompileTarget target,
+        ResourceKind resourceKind,
+        ref uint bufferIndex,
+        ref uint textureIndex,
+        ref uint uavIndex,
+        ref uint samplerIndex)
     {
-    case UniformBuffer:
-        return bufferIndex++;
-    case StorageBufferReadWrite:
-        if (target == MSL)
+        switch (resourceKind)
         {
-            return bufferIndex++;
+            case ResourceKind.UniformBuffer:
+                return bufferIndex++;
+
+            case ResourceKind.StructuredBufferReadWrite:
+                if (target == CrossCompileTarget.MSL)
+                {
+                    return bufferIndex++;
+                }
+                else
+                {
+                    return uavIndex++;
+                }
+
+            case ResourceKind.TextureReadWrite:
+                if (target == CrossCompileTarget.MSL)
+                {
+                    return textureIndex++;
+                }
+                else
+                {
+                    return uavIndex++;
+                }
+
+            case ResourceKind.TextureReadOnly:
+                return textureIndex++;
+
+            case ResourceKind.StructuredBufferReadOnly:
+                if (target == CrossCompileTarget.MSL)
+                {
+                    return bufferIndex++;
+                }
+                else
+                {
+                    return textureIndex++;
+                }
+
+            case ResourceKind.Sampler:
+                return samplerIndex++;
+
+            default:
+                throw new ArgumentException("Invalid ResourceKind.");
         }
-        else
-        {
-            return uavIndex++;
-        }
-    case StorageImage:
-        if (target == MSL)
-        {
-            return textureIndex++;
-        }
-        else
-        {
-            return uavIndex++;
-        }
-    case SampledImage:
-        return textureIndex++;
-    case StorageBufferReadOnly:
-        if (target == MSL)
-        {
-            return bufferIndex++;
-        }
-        else
-        {
-            return textureIndex++;
-        }
-    case Sampler:
-        return samplerIndex++;
-    default:
-        throw std::runtime_error("Invalid ResourceKind.");
     }
-}
 
-Compiler *GetCompiler(std::vector<uint32_t> spirvBytes, const CrossCompileInfo &info)
-{
-    switch (info.Target)
+    private static CrossCompiler* GetCompiler(Context* context, ParsedIr* ir, in CrossCompileInfo info)
     {
-    case HLSL:
+        CrossCompiler* compiler;
+        CompilerOptions* options;
+
+        switch (info.Target)
+        {
+            case CrossCompileTarget.HLSL:
+            {
+                api1.ContextCreateCompiler(context, Backend.Hlsl, ir, CaptureMode.TakeOwnership, &compiler).Check(context);
+                api1.CompilerCreateCompilerOptions(compiler, &options);
+
+                api1.CompilerOptionsSetUint(options, CompilerOption.HlslShaderModel, 50);
+                api1.CompilerOptionsSetBool(options, CompilerOption.HlslPointSizeCompat, 1);
+                break;
+            }
+
+            case CrossCompileTarget.GLSL:
+            case CrossCompileTarget.ESSL:
+            {
+                api1.ContextCreateCompiler(context, Backend.Glsl, ir, CaptureMode.TakeOwnership, &compiler).Check(context);
+                api1.CompilerCreateCompilerOptions(compiler, &options);
+
+                api1.CompilerOptionsSetBool(options, CompilerOption.GlslES, (byte)(info.Target == CrossCompileTarget.ESSL ? 1 : 0));
+                api1.CompilerOptionsSetBool(options, CompilerOption.GlslEnable420PackExtension, 0);
+
+                uint version;
+                if (info.ComputeShader.Count > 0)
+                {
+                    version = info.Target == CrossCompileTarget.GLSL ? 430u : 310;
+                }
+                else
+                {
+                    version = info.Target == CrossCompileTarget.GLSL ? 330u : 300;
+                }
+                api1.CompilerOptionsSetUint(options, CompilerOption.GlslVersion, version);
+                break;
+            }
+
+            case CrossCompileTarget.MSL:
+            {
+                api1.ContextCreateCompiler(context, Backend.Msl, ir, CaptureMode.TakeOwnership, &compiler).Check(context);
+                api1.CompilerCreateCompilerOptions(compiler, &options);
+                break;
+            }
+
+            default:
+                throw new ArgumentException("Invalid OutputKind.");
+        }
+
+        api1.CompilerOptionsSetBool(options, CompilerOption.FlipVertexY, (byte)(info.InvertY ? 1 : 0));
+        api1.CompilerOptionsSetBool(options, CompilerOption.FixupDepthConvention, (byte)(info.FixClipSpaceZ ? 1 : 0));
+
+        api1.CompilerInstallCompilerOptions(compiler, options).Check(context);
+        return compiler;
+    }
+
+    private static void SetSpecializations(CrossCompiler* compiler, in CrossCompileInfo info)
     {
-        auto ret = new CompilerHLSL(spirvBytes);
-        CompilerHLSL::Options opts = {};
-        opts.shader_model = 50;
-        opts.point_size_compat = true;
-        ret->set_hlsl_options(opts);
-        CompilerGLSL::Options commonOpts;
-        commonOpts.vertex.flip_vert_y = info.InvertY;
-        commonOpts.vertex.fixup_clipspace = info.FixClipSpaceZ;
-        ret->set_common_options(commonOpts);
+        Silk.NET.SPIRV.Cross.SpecializationConstant* specConstants;
+        nuint num_constants;
+        api1.CompilerGetSpecializationConstants(compiler, &specConstants, &num_constants);
+
+        for (nuint i = 0; i < info.Specializations.Count; i++)
+        {
+            uint constID = info.Specializations[i].ID;
+            uint varID = 0;
+
+            for (nuint j = 0; j < num_constants; j++)
+            {
+                var constant = specConstants[j];
+                if (constant.ConstantId == constID)
+                {
+                    varID = constant.Id;
+                }
+            }
+
+            if (varID != 0)
+            {
+                var constVar = api1.CompilerGetConstantHandle(compiler, varID);
+                api1.ConstantSetScalarU64(constVar, 0, 0, info.Specializations[i].Data);
+            }
+        }
+    }
+
+    private static InteropArray<NativeResourceLayoutDescription> CreateResourceLayoutArray(
+        Dictionary<BindingInfo, ResourceInfo> resources,
+        bool compute)
+    {
+        List<uint> setSizes = new();
+        foreach (BindingInfo it in resources.Keys)
+        {
+            uint set = it.Set;
+            while (setSizes.Count <= set)
+            {
+                setSizes.Add(0);
+            }
+            setSizes[(int)set] = Math.Max(setSizes[(int)set], it.Binding + 1);
+        }
+
+        int setCount = setSizes.Count;
+        InteropArray<NativeResourceLayoutDescription> ret = new((uint)setCount);
+
+        for (int i = 0; i < setCount; i++)
+        {
+            ret[i].ResourceElements = new(setSizes[i]);
+            for (int j = 0; j < setSizes[i]; j++)
+            {
+                ret[i].ResourceElements[j].Name = new InteropArray<byte>();
+                ret[i].ResourceElements[j].Kind = ResourceKind.UniformBuffer;
+                ret[i].ResourceElements[j].Stages = ShaderStages.None;
+                ret[i].ResourceElements[j].Options = ResourceLayoutElementOptions.Unused;
+            }
+        }
+
+        foreach (KeyValuePair<BindingInfo, ResourceInfo> it in resources)
+        {
+            ShaderStages stages = ShaderStages.None;
+            if (it.Value.IDs[0] != 0)
+            {
+                if (compute)
+                {
+                    stages |= ShaderStages.Compute;
+                }
+                else
+                {
+                    stages |= ShaderStages.Vertex;
+                }
+            }
+            if (it.Value.IDs[1] != 0)
+            {
+                stages |= ShaderStages.Fragment;
+            }
+
+            ret[it.Key.Set].ResourceElements[it.Key.Binding].Name = it.Value.Name;
+            ret[it.Key.Set].ResourceElements[it.Key.Binding].Kind = it.Value.Kind;
+            ret[it.Key.Set].ResourceElements[it.Key.Binding].Stages = stages;
+            ret[it.Key.Set].ResourceElements[it.Key.Binding].Options = 0;
+        }
+
         return ret;
     }
-    case GLSL:
-    case ESSL:
+
+    private static CompilationResult CompileVertexFragment(in CrossCompileInfo info)
     {
-        auto ret = new CompilerGLSL(spirvBytes);
-        CompilerGLSL::Options opts = {};
-        opts.es = info.Target == ESSL;
-        opts.enable_420pack_extension = false;
-        if (info.ComputeShader.Count > 0)
+        Context* context;
+        api1.ContextCreate(&context);
+
+        ParsedIr* vsBytes;
+        api1.ContextParseSpirv(context, info.VertexShader.Data, info.VertexShader.Count, &vsBytes).Check(context);
+        CrossCompiler* vsCompiler = GetCompiler(context, vsBytes, info);
+
+        ParsedIr* fsBytes;
+        api1.ContextParseSpirv(context, info.FragmentShader.Data, info.FragmentShader.Count, &fsBytes).Check(context);
+        CrossCompiler* fsCompiler = GetCompiler(context, fsBytes, info);
+
+        SetSpecializations(vsCompiler, info);
+        SetSpecializations(fsCompiler, info);
+
+        Resources* vsResources;
+        api1.CompilerCreateShaderResources(vsCompiler, &vsResources);
+        Resources* fsResources;
+        api1.CompilerCreateShaderResources(fsCompiler, &fsResources);
+
+        Dictionary<BindingInfo, ResourceInfo> allResources = new();
+
+        AddResources(vsResources, ResourceType.UniformBuffer, vsCompiler, allResources, 0, info.NormalizeResourceNames);
+        AddResources(vsResources, ResourceType.StorageBuffer, vsCompiler, allResources, 0, info.NormalizeResourceNames, false, true);
+        AddResources(vsResources, ResourceType.SeparateImage, vsCompiler, allResources, 0, info.NormalizeResourceNames, true, false);
+        AddResources(vsResources, ResourceType.StorageImage, vsCompiler, allResources, 0, info.NormalizeResourceNames, true, true);
+        AddResources(vsResources, ResourceType.SeparateSamplers, vsCompiler, allResources, 0, info.NormalizeResourceNames);
+
+        AddResources(fsResources, ResourceType.UniformBuffer, fsCompiler, allResources, 1, info.NormalizeResourceNames);
+        AddResources(fsResources, ResourceType.StorageBuffer, fsCompiler, allResources, 1, info.NormalizeResourceNames, false, true);
+        AddResources(fsResources, ResourceType.SeparateImage, fsCompiler, allResources, 1, info.NormalizeResourceNames, true, false);
+        AddResources(fsResources, ResourceType.StorageImage, fsCompiler, allResources, 1, info.NormalizeResourceNames, true, true);
+        AddResources(fsResources, ResourceType.SeparateSamplers, fsCompiler, allResources, 1, info.NormalizeResourceNames);
+
+        if (info.Target == CrossCompileTarget.HLSL || info.Target == CrossCompileTarget.MSL)
         {
-            opts.version = info.Target == GLSL ? 430 : 310;
+            uint bufferIndex = 0;
+            uint textureIndex = 0;
+            uint uavIndex = 0;
+            uint samplerIndex = 0;
+            foreach (ResourceInfo it in allResources.Values)
+            {
+                uint index = GetResourceIndex(
+                    info.Target, it.Kind, ref bufferIndex, ref textureIndex, ref uavIndex, ref samplerIndex);
+
+                uint vsID = it.IDs[0];
+                if (vsID != 0)
+                {
+                    api1.CompilerSetDecoration(vsCompiler, vsID, Silk.NET.SPIRV.Decoration.Binding, index);
+                }
+
+                uint fsID = it.IDs[1];
+                if (fsID != 0)
+                {
+                    api1.CompilerSetDecoration(fsCompiler, fsID, Silk.NET.SPIRV.Decoration.Binding, index);
+                }
+            }
         }
-        else
+
+        if (info.Target == CrossCompileTarget.GLSL || info.Target == CrossCompileTarget.ESSL)
         {
-            opts.version = info.Target == GLSL ? 330 : 300;
+            uint vsId;
+            api1.CompilerBuildDummySamplerForCombinedImages(vsCompiler, &vsId);
+            api1.CompilerBuildCombinedImageSamplers(vsCompiler);
+
+            CombinedImageSampler* vsSamplers;
+            nuint vsSamplerSize;
+            api1.CompilerGetCombinedImageSamplers(vsCompiler, &vsSamplers, &vsSamplerSize);
+            for (nuint i = 0; i < vsSamplerSize; i++)
+            {
+                CombinedImageSampler* remap = &vsSamplers[i];
+                api1.CompilerSetName(vsCompiler, remap->CombinedId, api1.CompilerGetName(vsCompiler, remap->ImageId));
+            }
+
+            uint fsId;
+            api1.CompilerBuildDummySamplerForCombinedImages(vsCompiler, &fsId);
+            api1.CompilerBuildCombinedImageSamplers(vsCompiler);
+
+            CombinedImageSampler* fsSamplers;
+            nuint fsSamplerSize;
+            api1.CompilerGetCombinedImageSamplers(fsCompiler, &fsSamplers, &fsSamplerSize);
+            for (nuint i = 0; i < fsSamplerSize; i++)
+            {
+                CombinedImageSampler* remap = &fsSamplers[i];
+                api1.CompilerSetName(fsCompiler, remap->CombinedId, api1.CompilerGetName(fsCompiler, remap->ImageId));
+            }
+
+            ReflectedResource* resList;
+            nuint resSize;
+            api1.ResourcesGetResourceListForType(vsResources, ResourceType.StageOutput, &resList, &resSize);
+            for (nuint i = 0; i < resSize; i++)
+            {
+                ReflectedResource* output = &resList[i];
+
+                uint location = api1.CompilerGetDecoration(vsCompiler, output->Id, Decoration.Location);
+                using var newName = InteropArray.ToUtf8($"vdspv_fsin{location}");
+                api1.CompilerSetName(vsCompiler, output->Id, newName.Data);
+            }
+
+            api1.ResourcesGetResourceListForType(vsResources, ResourceType.StageInput, &resList, &resSize);
+            for (nuint i = 0; i < resSize; i++)
+            {
+                ReflectedResource* input = &resList[i];
+
+                uint location = api1.CompilerGetDecoration(fsCompiler, input->Id, Decoration.Location);
+                using var newName = InteropArray.ToUtf8($"vdspv_fsin{location}");
+                api1.CompilerSetName(fsCompiler, input->Id, newName.Data);
+            }
         }
-        opts.vertex.fixup_clipspace = info.FixClipSpaceZ;
-        opts.vertex.flip_vert_y = info.InvertY;
-        ret->set_common_options(opts);
+
+        if (info.Target == CrossCompileTarget.ESSL)
+        {
+            ReflectedResource* resList;
+            nuint resSize;
+            api1.ResourcesGetResourceListForType(vsResources, ResourceType.UniformBuffer, &resList, &resSize);
+            for (nuint i = 0; i < resSize; i++)
+            {
+                ReflectedResource* uniformBuffer = &resList[i];
+                api1.CompilerUnsetDecoration(vsCompiler, uniformBuffer->Id, Decoration.Binding);
+            }
+
+            uint bufferIndex = 0;
+            uint imageIndex = 0;
+            foreach (var it in allResources.Values)
+            {
+                if (it.Kind == ResourceKind.StructuredBufferReadOnly || it.Kind == ResourceKind.StructuredBufferReadWrite)
+                {
+                    uint id = bufferIndex++;
+                    if (it.IDs[0] != 0)
+                    {
+                        api1.CompilerSetDecoration(vsCompiler, it.IDs[0], Decoration.Binding, id);
+                    }
+                    if (it.IDs[1] != 0)
+                    {
+                        api1.CompilerSetDecoration(fsCompiler, it.IDs[1], Decoration.Binding, id);
+                    }
+                }
+                else if (it.Kind == ResourceKind.TextureReadWrite)
+                {
+                    uint id = imageIndex++;
+                    if (it.IDs[0] != 0)
+                    {
+                        api1.CompilerSetDecoration(vsCompiler, it.IDs[0], Decoration.Binding, id);
+                    }
+                    if (it.IDs[1] != 0)
+                    {
+                        api1.CompilerSetDecoration(fsCompiler, it.IDs[1], Decoration.Binding, id);
+                    }
+                }
+            }
+        }
+
+        byte* vsText;
+        api1.CompilerCompile(vsCompiler, &vsText).Check(context);
+        string vsStr = Util.UTF8.GetString(MemoryMarshal.CreateReadOnlySpanFromNullTerminated(vsText));
+
+        ReflectedResource* tmpList;
+        nuint bufCount;
+        nuint imgCount;
+        api1.ResourcesGetResourceListForType(vsResources, ResourceType.StorageBuffer, &tmpList, &bufCount);
+        api1.ResourcesGetResourceListForType(vsResources, ResourceType.StorageImage, &tmpList, &imgCount);
+        bool usesStorageResource = bufCount > 0 || imgCount > 0;
+
+        if (info.Target == CrossCompileTarget.GLSL && usesStorageResource)
+        {
+            string key = "#version 330";
+            vsStr = vsStr.Replace(key, "#version 430");
+        }
+        else if (info.Target == CrossCompileTarget.ESSL && usesStorageResource)
+        {
+            string key = "#version 300";
+            vsStr = vsStr.Replace(key, "#version 310");
+        }
+
+        byte* fsText;
+        api1.CompilerCompile(fsCompiler, &fsText);
+        string fsStr = Util.UTF8.GetString(MemoryMarshal.CreateReadOnlySpanFromNullTerminated(fsText));
+
+        api1.ResourcesGetResourceListForType(fsResources, ResourceType.StorageBuffer, &tmpList, &bufCount);
+        api1.ResourcesGetResourceListForType(fsResources, ResourceType.StorageImage, &tmpList, &imgCount);
+        usesStorageResource = bufCount > 0 || imgCount > 0;
+
+        if (info.Target == CrossCompileTarget.GLSL && usesStorageResource)
+        {
+            string key = "#version 330";
+            fsStr = fsStr.Replace(key, "#version 430");
+        }
+        else if (info.Target == CrossCompileTarget.ESSL && usesStorageResource)
+        {
+            string key = "#version 300";
+            fsStr = fsStr.Replace(key, "#version 310");
+        }
+
+        CompilationResult result = new CompilationResult();
+        result.Succeeded = true;
+
+        result.DataBuffers = new InteropArray<InteropArray<byte>>(2);
+        result.DataBuffers[0] = InteropArray.ToUtf8(vsStr);
+        result.DataBuffers[1] = InteropArray.ToUtf8(fsStr);
+
+        ReflectVertexInfo(vsCompiler, vsResources, ref result.Reflection);
+        result.Reflection.ResourceLayouts = CreateResourceLayoutArray(allResources, false);
+
+        //delete vsCompiler;
+        //delete fsCompiler;
+
+        return result;
+    }
+
+    private static CompilationResult CompileCompute(in CrossCompileInfo info)
+    {
+        Context* context;
+        api1.ContextCreate(&context);
+
+        ParsedIr* csBytes;
+        api1.ContextParseSpirv(context, info.ComputeShader.Data, info.ComputeShader.Count, &csBytes).Check(context);
+        CrossCompiler* csCompiler = GetCompiler(context, csBytes, info);
+
+        SetSpecializations(csCompiler, info);
+
+        Resources* csResources;
+        api1.CompilerCreateShaderResources(csCompiler, &csResources);
+
+        Dictionary<BindingInfo, ResourceInfo> allResources = new();
+
+        AddResources(csResources, ResourceType.UniformBuffer, csCompiler, allResources, 0, info.NormalizeResourceNames);
+        AddResources(csResources, ResourceType.StorageBuffer, csCompiler, allResources, 0, info.NormalizeResourceNames, false, true);
+        AddResources(csResources, ResourceType.SeparateImage, csCompiler, allResources, 0, info.NormalizeResourceNames, true, false);
+        AddResources(csResources, ResourceType.StorageImage, csCompiler, allResources, 0, info.NormalizeResourceNames, true, true);
+        AddResources(csResources, ResourceType.SeparateSamplers, csCompiler, allResources, 0, info.NormalizeResourceNames);
+
+        if (info.Target == CrossCompileTarget.HLSL || info.Target == CrossCompileTarget.MSL)
+        {
+            uint bufferIndex = 0;
+            uint textureIndex = 0;
+            uint uavIndex = 0;
+            uint samplerIndex = 0;
+            foreach (ResourceInfo it in allResources.Values)
+            {
+                uint index = GetResourceIndex(info.Target, it.Kind, ref bufferIndex, ref textureIndex, ref uavIndex, ref samplerIndex);
+
+                uint csID = it.IDs[0];
+                if (csID != 0)
+                {
+                    api1.CompilerSetDecoration(csCompiler, csID, Decoration.Binding, index);
+                }
+            }
+        }
+
+        if (info.Target == CrossCompileTarget.GLSL || info.Target == CrossCompileTarget.ESSL)
+        {
+            uint csId;
+            api1.CompilerBuildDummySamplerForCombinedImages(csCompiler, &csId);
+            api1.CompilerBuildCombinedImageSamplers(csCompiler);
+
+            CombinedImageSampler* csSamplers;
+            nuint csSamplerSize;
+            api1.CompilerGetCombinedImageSamplers(csCompiler, &csSamplers, &csSamplerSize);
+            for (nuint i = 0; i < csSamplerSize; i++)
+            {
+                CombinedImageSampler* remap = &csSamplers[i];
+                api1.CompilerSetName(csCompiler, remap->CombinedId, api1.CompilerGetName(csCompiler, remap->ImageId));
+            }
+        }
+
+        if (info.Target == CrossCompileTarget.ESSL)
+        {
+            ReflectedResource* bufferList;
+            nuint bufferCount;
+            api1.ResourcesGetResourceListForType(csResources, ResourceType.UniformBuffer, &bufferList, &bufferCount);
+            for (nuint i = 0; i < bufferCount; i++)
+            {
+                ReflectedResource* uniformBuffer = &bufferList[i];
+                api1.CompilerUnsetDecoration(csCompiler, uniformBuffer->Id, Decoration.Binding);
+            }
+
+            uint bufferIndex = 0;
+            uint imageIndex = 0;
+            foreach (ResourceInfo it in allResources.Values)
+            {
+                if (it.Kind == ResourceKind.StructuredBufferReadOnly || it.Kind == ResourceKind.StructuredBufferReadWrite)
+                {
+                    api1.CompilerSetDecoration(csCompiler, it.IDs[0], Decoration.Binding, bufferIndex++);
+                }
+                else if (it.Kind == ResourceKind.TextureReadWrite)
+                {
+                    api1.CompilerSetDecoration(csCompiler, it.IDs[0], Decoration.Binding, imageIndex++);
+                }
+            }
+        }
+
+        byte* csText;
+        api1.CompilerCompile(csCompiler, &csText).Check(context);
+
+        CompilationResult result = new(InteropArray.FromNullTerminated(csText).Clone())
+        {
+            Succeeded = true,
+        };
+        result.Reflection.ResourceLayouts = CreateResourceLayoutArray(allResources, true);
+
+        return result;
+    }
+
+    public static CompilationResult Compile(in CrossCompileInfo info)
+    {
+        if (info.VertexShader.Count > 0 && info.FragmentShader.Count > 0)
+        {
+            return CompileVertexFragment(info);
+        }
+        else if (info.ComputeShader.Count > 0)
+        {
+            return CompileCompute(info);
+        }
+
+        return new CompilationResult("The given combination of shaders was not valid.");
+    }
+
+    /*
+    std::vector<uint32_t> ReadFile(std::string path)
+    {
+        std::ifstream is(path, std::ios::binary | std::ios::in | std::ios::ate);
+        size_t size = is.tellg();
+        is.seekg(0, std::ios::beg);
+        char *shaderCode = new char[size];
+        is.read(shaderCode, size);
+        is.close();
+
+        std::vector<uint32_t> ret(size / 4);
+        memcpy(ret.data(), shaderCode, size);
+
+        delete[] shaderCode;
         return ret;
     }
-    case MSL:
+
+    void WriteToFile(const std::string &path, const std::string &text)
     {
-        auto ret = new CompilerMSL(spirvBytes);
-        CompilerMSL::Options opts = {};
-        ret->set_msl_options(opts);
-        CompilerGLSL::Options commonOpts;
-        commonOpts.vertex.flip_vert_y = info.InvertY;
-        commonOpts.vertex.fixup_clipspace = info.FixClipSpaceZ;
-        ret->set_common_options(commonOpts);
-        return ret;
+        auto outFile = std::ofstream(path);
+        outFile << text;
+        outFile.close();
     }
-    default:
-        throw std::runtime_error("Invalid OutputKind.");
-    }
-}
+    */
 
-void SetSpecializations(spirv_cross::Compiler *compiler, const CrossCompileInfo &info)
-{
-    auto specConstants = compiler->get_specialization_constants();
-    for (uint32_t i = 0; i < info.Specializations.Count; i++)
+    public static CompilationResult CompileGLSLToSPIRV(in GlslCompileInfo info, CompileOptions* options)
     {
-        uint32_t constID = info.Specializations[i].ID;
-        uint32_t varID = 0;
-
-        for (auto &constant : specConstants)
-        {
-            if (constant.constant_id == constID)
-            {
-                varID = constant.id;
-            }
-        }
-
-        if (varID != 0)
-        {
-            auto &constVar = compiler->get_constant(varID);
-            constVar.m.c[0].r[0].u64 = info.Specializations[i].Constant;
-        }
-    }
-}
-
-InteropArray<ResourceLayoutDescription> CreateResourceLayoutArray(
-    std::map<BindingInfo, ResourceInfo> resources,
-    bool compute)
-{
-    uint32_t currentSet = 0;
-    std::vector<uint32_t> setSizes(1);
-    for (auto& it : resources)
-    {
-        uint32_t set = it.first.Set;
-        if (setSizes.size() <= set)
-        {
-            setSizes.resize(set + 1);
-        }
-        setSizes[set] = std::max(setSizes[set], it.first.Binding + 1);
-    }
-
-    uint32_t setCount = setSizes.size();
-    InteropArray<ResourceLayoutDescription> ret(setCount);
-
-    for (uint32_t i = 0; i < setCount; i++)
-    {
-        ret[i].ResourceElements.Resize(setSizes[i]);
-        for (uint32_t j = 0; j < setSizes[i]; j++)
-        {
-            ret[i].ResourceElements[j].Name = InteropArray<char>();
-            ret[i].ResourceElements[j].Kind = ResourceKind::UniformBuffer;
-            ret[i].ResourceElements[j].Stages = ShaderStages::None;
-            ret[i].ResourceElements[j].Options = 2; // "Unused"
-        }
-    }
-
-    for (auto& it : resources)
-    {
-        ShaderStages stages = ShaderStages::None;
-        if (it.second.IDs[0] != 0)
-        {
-            if (compute) { stages = stages | ShaderStages::Compute; }
-            else { stages = stages | ShaderStages::Vertex; }
-        }
-        if (it.second.IDs[1] != 0)
-        {
-            stages = stages | ShaderStages::Fragment;
-        }
-
-        ret[it.first.Set].ResourceElements[it.first.Binding].Name.CopyFrom(it.second.Name.length(), it.second.Name.c_str());
-        ret[it.first.Set].ResourceElements[it.first.Binding].Kind = it.second.Kind;
-        ret[it.first.Set].ResourceElements[it.first.Binding].Stages = stages;
-        ret[it.first.Set].ResourceElements[it.first.Binding].Options = 0;
-    }
-
-    return ret;
-}
-
-CompilationResult *CompileVertexFragment(const CrossCompileInfo &info)
-{
-    std::vector<uint32_t> vsBytes(
-        info.VertexShader.Data,
-        info.VertexShader.Data + info.VertexShader.Count);
-    Compiler *vsCompiler = GetCompiler(vsBytes, info);
-
-    std::vector<uint32_t> fsBytes(
-        info.FragmentShader.Data,
-        info.FragmentShader.Data + info.FragmentShader.Count);
-    Compiler *fsCompiler = GetCompiler(fsBytes, info);
-
-    SetSpecializations(vsCompiler, info);
-    SetSpecializations(fsCompiler, info);
-
-    ShaderResources vsResources = vsCompiler->get_shader_resources();
-    ShaderResources fsResources = fsCompiler->get_shader_resources();
-
-    std::map<BindingInfo, ResourceInfo> allResources;
-
-    AddResources(vsResources.uniform_buffers, vsCompiler, allResources, 0, info.NormalizeResourceNames);
-    AddResources(vsResources.storage_buffers, vsCompiler, allResources, 0, info.NormalizeResourceNames, false, true);
-    AddResources(vsResources.separate_images, vsCompiler, allResources, 0, info.NormalizeResourceNames, true, false);
-    AddResources(vsResources.storage_images, vsCompiler, allResources, 0, info.NormalizeResourceNames, true, true);
-    AddResources(vsResources.separate_samplers, vsCompiler, allResources, 0, info.NormalizeResourceNames);
-
-    AddResources(fsResources.uniform_buffers, fsCompiler, allResources, 1, info.NormalizeResourceNames);
-    AddResources(fsResources.storage_buffers, fsCompiler, allResources, 1, info.NormalizeResourceNames, false, true);
-    AddResources(fsResources.separate_images, fsCompiler, allResources, 1, info.NormalizeResourceNames, true, false);
-    AddResources(fsResources.storage_images, fsCompiler, allResources, 1, info.NormalizeResourceNames, true, true);
-    AddResources(fsResources.separate_samplers, fsCompiler, allResources, 1, info.NormalizeResourceNames);
-
-    if (info.Target == HLSL || info.Target == MSL)
-    {
-        uint32_t bufferIndex = 0;
-        uint32_t textureIndex = 0;
-        uint32_t uavIndex = 0;
-        uint32_t samplerIndex = 0;
-        for (auto &it : allResources)
-        {
-            uint32_t index = GetResourceIndex(info.Target, it.second.Kind, bufferIndex, textureIndex, uavIndex, samplerIndex);
-
-            uint32_t vsID = it.second.IDs[0];
-            if (vsID != 0)
-            {
-                vsCompiler->set_decoration(vsID, spv::Decoration::DecorationBinding, index);
-            }
-            uint32_t fsID = it.second.IDs[1];
-            if (fsID != 0)
-            {
-                fsCompiler->set_decoration(fsID, spv::Decoration::DecorationBinding, index);
-            }
-        }
-    }
-
-    if (info.Target == GLSL || info.Target == ESSL)
-    {
-        vsCompiler->build_dummy_sampler_for_combined_images();
-        vsCompiler->build_combined_image_samplers();
-        for (auto &remap : vsCompiler->get_combined_image_samplers())
-        {
-            vsCompiler->set_name(remap.combined_id, vsCompiler->get_name(remap.image_id));
-        }
-
-        fsCompiler->build_dummy_sampler_for_combined_images();
-        fsCompiler->build_combined_image_samplers();
-        for (auto &remap : fsCompiler->get_combined_image_samplers())
-        {
-            fsCompiler->set_name(remap.combined_id, fsCompiler->get_name(remap.image_id));
-        }
-
-        for (auto &output : vsResources.stage_outputs)
-        {
-            uint32_t location = vsCompiler->get_decoration(output.id, spv::Decoration::DecorationLocation);
-            std::string newName = "vdspv_fsin" + std::to_string(location);
-            vsCompiler->set_name(output.id, newName);
-        }
-
-        for (auto &input : fsResources.stage_inputs)
-        {
-            uint32_t location = fsCompiler->get_decoration(input.id, spv::Decoration::DecorationLocation);
-            std::string newName = "vdspv_fsin" + std::to_string(location);
-            fsCompiler->set_name(input.id, newName);
-        }
-    }
-
-    if (info.Target == ESSL)
-    {
-        for (auto &uniformBuffer : vsResources.uniform_buffers)
-        {
-            vsCompiler->unset_decoration(uniformBuffer.id, spv::Decoration::DecorationBinding);
-        }
-
-        uint32_t bufferIndex = 0;
-        uint32_t imageIndex = 0;
-        for (auto &it : allResources)
-        {
-            if (it.second.Kind == StorageBufferReadOnly || it.second.Kind == StorageBufferReadWrite)
-            {
-                uint32_t id = bufferIndex++;
-                if (it.second.IDs[0] != 0)
-                {
-                    vsCompiler->set_decoration(it.second.IDs[0], spv::Decoration::DecorationBinding, id);
-                }
-                if (it.second.IDs[1] != 0)
-                {
-                    fsCompiler->set_decoration(it.second.IDs[1], spv::Decoration::DecorationBinding, id);
-                }
-            }
-            else if (it.second.Kind == StorageImage)
-            {
-                uint32_t id = imageIndex++;
-                if (it.second.IDs[0] != 0)
-                {
-                    vsCompiler->set_decoration(it.second.IDs[0], spv::Decoration::DecorationBinding, id);
-                }
-                if (it.second.IDs[1] != 0)
-                {
-                    fsCompiler->set_decoration(it.second.IDs[1], spv::Decoration::DecorationBinding, id);
-                }
-            }
-        }
-    }
-
-    std::string vsText = vsCompiler->compile();
-
-    bool usesStorageResource = vsResources.storage_buffers.size() > 0 || vsResources.storage_images.size() > 0;
-    if (info.Target == GLSL && usesStorageResource)
-    {
-        std::string key = "#version 330";
-        vsText.replace(vsText.find(key), key.length(), "#version 430");
-    }
-    else if (info.Target == ESSL && usesStorageResource)
-    {
-        std::string key = "#version 300";
-        vsText.replace(vsText.find(key), key.length(), "#version 310");
-    }
-
-    std::string fsText = fsCompiler->compile();
-
-    usesStorageResource = fsResources.storage_buffers.size() > 0 || fsResources.storage_images.size() > 0;
-    if (info.Target == GLSL && usesStorageResource)
-    {
-        std::string key = "#version 330";
-        fsText.replace(vsText.find(key), key.length(), "#version 430");
-    }
-    else if (info.Target == ESSL && usesStorageResource)
-    {
-        std::string key = "#version 300";
-        fsText.replace(vsText.find(key), key.length(), "#version 310");
-    }
-
-    CompilationResult *result = new CompilationResult();
-    result->Succeeded = true;
-
-    result->DataBuffers.Resize(2);
-    result->DataBuffers[0].CopyFrom(static_cast<uint32_t>(vsText.length()), (uint8_t *)vsText.c_str());
-    result->DataBuffers[1].CopyFrom(static_cast<uint32_t>(fsText.length()), (uint8_t *)fsText.c_str());
-
-    ReflectVertexInfo(*vsCompiler, vsResources, result->Reflection);
-    result->Reflection.ResourceLayouts = CreateResourceLayoutArray(allResources, false);
-
-    delete vsCompiler;
-    delete fsCompiler;
-
-    return result;
-}
-
-CompilationResult *CompileCompute(const CrossCompileInfo &info)
-{
-    std::vector<uint32_t> csBytes(
-        info.ComputeShader.Data,
-        info.ComputeShader.Data + info.ComputeShader.Count);
-    Compiler *csCompiler = GetCompiler(csBytes, info);
-
-    SetSpecializations(csCompiler, info);
-
-    ShaderResources csResources = csCompiler->get_shader_resources();
-
-    std::map<BindingInfo, ResourceInfo> allResources;
-
-    AddResources(csResources.uniform_buffers, csCompiler, allResources, 0, info.NormalizeResourceNames);
-    AddResources(csResources.storage_buffers, csCompiler, allResources, 0, info.NormalizeResourceNames, false, true);
-    AddResources(csResources.separate_images, csCompiler, allResources, 0, info.NormalizeResourceNames, true, false);
-    AddResources(csResources.storage_images, csCompiler, allResources, 0, info.NormalizeResourceNames, true, true);
-    AddResources(csResources.separate_samplers, csCompiler, allResources, 0, info.NormalizeResourceNames);
-
-    if (info.Target == HLSL || info.Target == MSL)
-    {
-        uint32_t bufferIndex = 0;
-        uint32_t textureIndex = 0;
-        uint32_t uavIndex = 0;
-        uint32_t samplerIndex = 0;
-        for (auto &it : allResources)
-        {
-            uint32_t index = GetResourceIndex(info.Target, it.second.Kind, bufferIndex, textureIndex, uavIndex, samplerIndex);
-
-            uint32_t csID = it.second.IDs[0];
-            if (csID != 0)
-            {
-                csCompiler->set_decoration(csID, spv::Decoration::DecorationBinding, index);
-            }
-        }
-    }
-
-    if (info.Target == GLSL || info.Target == ESSL)
-    {
-        csCompiler->build_dummy_sampler_for_combined_images();
-        csCompiler->build_combined_image_samplers();
-        for (auto &remap : csCompiler->get_combined_image_samplers())
-        {
-            csCompiler->set_name(remap.combined_id, csCompiler->get_name(remap.image_id));
-        }
-    }
-
-    if (info.Target == ESSL)
-    {
-        for (auto &uniformBuffer : csResources.uniform_buffers)
-        {
-            csCompiler->unset_decoration(uniformBuffer.id, spv::Decoration::DecorationBinding);
-        }
-
-        uint32_t bufferIndex = 0;
-        uint32_t imageIndex = 0;
-        for (auto &it : allResources)
-        {
-            if (it.second.Kind == StorageBufferReadOnly || it.second.Kind == StorageBufferReadWrite)
-            {
-                csCompiler->set_decoration(it.second.IDs[0], spv::Decoration::DecorationBinding, bufferIndex++);
-            }
-            else if (it.second.Kind == StorageImage)
-            {
-                csCompiler->set_decoration(it.second.IDs[0], spv::Decoration::DecorationBinding, imageIndex++);
-            }
-        }
-    }
-
-    std::string csText = csCompiler->compile();
-
-    delete csCompiler;
-
-    CompilationResult *result = new CompilationResult();
-    result->Succeeded = true;
-    result->DataBuffers.Resize(1);
-    result->DataBuffers[0].CopyFrom(static_cast<uint32_t>(csText.length()), (uint8_t *)csText.c_str());
-
-    result->Reflection.ResourceLayouts = CreateResourceLayoutArray(allResources, true);
-
-    return result;
-}
-
-CompilationResult *Compile(const CrossCompileInfo &info)
-{
-    if (info.VertexShader.Count > 0 && info.FragmentShader.Count > 0)
-    {
-        return CompileVertexFragment(info);
-    }
-    else if (info.ComputeShader.Count > 0)
-    {
-        return CompileCompute(info);
-    }
-
-    return new CompilationResult("The given combination of shaders was not valid.");
-}
-
-std::vector<uint32_t> ReadFile(std::string path)
-{
-    std::ifstream is(path, std::ios::binary | std::ios::in | std::ios::ate);
-    size_t size = is.tellg();
-    is.seekg(0, std::ios::beg);
-    char *shaderCode = new char[size];
-    is.read(shaderCode, size);
-    is.close();
-
-    std::vector<uint32_t> ret(size / 4);
-    memcpy(ret.data(), shaderCode, size);
-
-    delete[] shaderCode;
-    return ret;
-}
-
-void WriteToFile(const std::string &path, const std::string &text)
-{
-    auto outFile = std::ofstream(path);
-    outFile << text;
-    outFile.close();
-}
-
-CompilationResult *CompileGLSLToSPIRV(
-    const std::string sourceText,
-    shaderc_shader_kind kind,
-    std::string fileName,
-    const shaderc::CompileOptions &options)
-{
-    shaderc::Compiler compiler;
-    shaderc::SpvCompilationResult result = compiler.CompileGlslToSpv(sourceText, kind, fileName.c_str(), options);
-
-    if (result.GetCompilationStatus() != shaderc_compilation_status_success)
-    {
-        return new CompilationResult(result.GetErrorMessage());
-    }
-
-    uint32_t length = static_cast<uint32_t>(result.end() - result.begin()) * sizeof(uint32_t);
-    CompilationResult *ret = new CompilationResult();
-    ret->Succeeded = 1;
-    ret->DataBuffers.Resize(1);
-    ret->DataBuffers[0].CopyFrom(length, (uint8_t *)result.begin());
-    return ret;
-}
-
-VD_EXPORT CompilationResult *CrossCompile(CrossCompileInfo *info)
-{
-    try
-    {
-        return Compile(*info);
-    }
-    catch (const std::exception &e)
-    {
-        return new CompilationResult(e.what());
-    }
-}
-
-VD_EXPORT CompilationResult *CompileGlslToSpirv(GlslCompileInfo *info)
-{
-    try
-    {
-        shaderc::CompileOptions options;
-
-        if (info->Debug)
-        {
-            options.SetGenerateDebugInfo();
-        }
-        else
-        {
-            options.SetOptimizationLevel(shaderc_optimization_level_performance);
-        }
-
-        for (uint32_t i = 0; i < info->Macros.Count; i++)
-        {
-            const MacroDefinition &macro = info->Macros[i];
-            if (macro.ValueLength == 0)
-            {
-                options.AddMacroDefinition(std::string(macro.Name, macro.NameLength));
-            }
-            else
-            {
-                options.AddMacroDefinition(
-                    std::string(macro.Name, macro.NameLength),
-                    std::string(macro.Value, macro.ValueLength));
-            }
-        }
-
-        return CompileGLSLToSPIRV(
-            std::string(info->SourceText.Data, info->SourceText.Count),
-            info->Kind,
-            std::string(info->FileName.Data, info->FileName.Count),
+        ShaderCompiler* compiler = api2.CompilerInitialize();
+        Silk.NET.Shaderc.CompilationResult* res = api2.CompileIntoSpv(
+            compiler,
+            info.SourceText.Data,
+            info.SourceText.Count,
+            info.Kind,
+            info.FileName.Data,
+            "main\0"u8,
             options);
-    }
-    catch (std::exception e)
-    {
-        return new CompilationResult(e.what());
-    }
-}
 
-VD_EXPORT void FreeResult(CompilationResult *result)
-{
-    delete result;
-}
-
-const VertexElementFormat FloatFormats[] =
-    {
-        VertexElementFormat::Float1,
-        VertexElementFormat::Float1,
-        VertexElementFormat::Float2,
-        VertexElementFormat::Float3,
-        VertexElementFormat::Float4};
-
-const VertexElementFormat IntFormats[] =
-    {
-        VertexElementFormat::Int1,
-        VertexElementFormat::Int1,
-        VertexElementFormat::Int2,
-        VertexElementFormat::Int3,
-        VertexElementFormat::Int4,
-};
-
-const VertexElementFormat UIntFormats[] =
-    {
-        VertexElementFormat::UInt1,
-        VertexElementFormat::UInt1,
-        VertexElementFormat::UInt2,
-        VertexElementFormat::UInt3,
-        VertexElementFormat::UInt4,
-};
-
-void ReflectVertexInfo(const Compiler &compiler, const ShaderResources &resources, ReflectionInfo &info)
-{
-    uint32_t elementCount = 0;
-    for (const auto &input : resources.stage_inputs)
-    {
-        uint32_t location = compiler.get_decoration(input.id, spv::DecorationLocation);
-        elementCount = std::max(location + 1, elementCount);
-    }
-
-    info.VertexElements = InteropArray<VertexElementDescription>(elementCount);
-
-    for (const auto &input : resources.stage_inputs)
-    {
-        uint32_t location = compiler.get_decoration(input.id, spv::DecorationLocation);
-        info.VertexElements[location].Semantic = VertexElementSemantic::TextureCoordinate;
-        std::string name = compiler.get_name(input.id);
-        if (name.empty())
+        if (api2.ResultGetCompilationStatus(res) != CompilationStatus.Success)
         {
-            name = compiler.get_fallback_name(input.id);
+            InteropArray<byte> msg = InteropArray.FromNullTerminated(api2.ResultGetErrorMessage(res));
+            return new CompilationResult(msg.Clone());
         }
-        info.VertexElements[location].Name.CopyFrom(name.size(), name.c_str());
-        SPIRType baseType = compiler.get_type(input.base_type_id);
-        SPIRType type = compiler.get_type(input.type_id);
-        switch (baseType.basetype)
+
+        InteropArray<byte> array = new(
+            api2.ResultGetLength(res),
+            api2.ResultGetBytes(res));
+
+        return new CompilationResult(array.Clone()) { Succeeded = true };
+
+        //api2.ResultRelease(res);
+        //api2.CompilerRelease(compiler);
+    }
+
+    public static CompilationResult CrossCompile(in CrossCompileInfo info)
+    {
+        try
         {
-        case SPIRType::Float:
-            info.VertexElements[location].Format = FloatFormats[baseType.vecsize];
-            break;
-        case SPIRType::Int:
-            info.VertexElements[location].Format = IntFormats[baseType.vecsize];
-            break;
-        case SPIRType::UInt:
-            info.VertexElements[location].Format = UIntFormats[baseType.vecsize];
-            break;
-        default:
-            throw std::runtime_error("Unhandled SPIR-V vertex input data type.");
+            return Compile(info);
+        }
+        catch (Exception ex)
+        {
+            return new CompilationResult(ex.ToString());
         }
     }
+
+    public static CompilationResult CompileGlslToSpirv(in GlslCompileInfo info)
+    {
+        CompileOptions* options = api2.CompileOptionsInitialize();
+        try
+        {
+            api2.CompileOptionsSetSourceLanguage(options, Silk.NET.Shaderc.SourceLanguage.Glsl);
+
+            if (info.Debug)
+            {
+                api2.CompileOptionsSetGenerateDebugInfo(options);
+            }
+            else
+            {
+                api2.CompileOptionsSetOptimizationLevel(options, OptimizationLevel.Performance);
+            }
+
+            for (uint i = 0; i < info.Macros.Count; i++)
+            {
+                ref NativeMacroDefinition macro = ref info.Macros[i];
+                api2.CompileOptionsAddMacroDefinition(options, macro.Name, macro.NameLength, macro.Value, macro.ValueLength);
+            }
+
+            return CompileGLSLToSPIRV(info, options);
+        }
+        catch (Exception e)
+        {
+            return new CompilationResult(e.ToString());
+        }
+        //finally
+        //{
+        //    api2.CompileOptionsRelease(options);
+        //}
+    }
+
+    private static ReadOnlySpan<VertexElementFormat> FloatFormats =>
+    [
+        VertexElementFormat.Float1,
+        VertexElementFormat.Float1,
+        VertexElementFormat.Float2,
+        VertexElementFormat.Float3,
+        VertexElementFormat.Float4
+    ];
+
+    private static ReadOnlySpan<VertexElementFormat> IntFormats =>
+    [
+        VertexElementFormat.Int1,
+        VertexElementFormat.Int1,
+        VertexElementFormat.Int2,
+        VertexElementFormat.Int3,
+        VertexElementFormat.Int4,
+    ];
+
+    private static ReadOnlySpan<VertexElementFormat> UIntFormats =>
+    [
+        VertexElementFormat.UInt1,
+        VertexElementFormat.UInt1,
+        VertexElementFormat.UInt2,
+        VertexElementFormat.UInt3,
+        VertexElementFormat.UInt4,
+    ];
+
+    private static void ReflectVertexInfo(CrossCompiler* compiler, Resources* resources, ref ReflectionInfo info)
+    {
+        uint elementCount = 0;
+        ReflectedResource* resList;
+        nuint resSize;
+        api1.ResourcesGetResourceListForType(resources, ResourceType.StageInput, &resList, &resSize);
+        for (nuint i = 0; i < resSize; i++)
+        {
+            ReflectedResource* input = &resList[i];
+
+            uint location = api1.CompilerGetDecoration(compiler, input->Id, Decoration.Location);
+            elementCount = Math.Max(location + 1, elementCount);
+        }
+
+        info.VertexElements = new InteropArray<NativeVertexElementDescription>(elementCount);
+
+        for (nuint i = 0; i < resSize; i++)
+        {
+            ReflectedResource* input = &resList[i];
+
+            uint location = api1.CompilerGetDecoration(compiler, input->Id, Decoration.Location);
+            info.VertexElements[location].Semantic = VertexElementSemantic.TextureCoordinate;
+            InteropArray<byte> name = InteropArray.FromNullTerminated(api1.CompilerGetName(compiler, input->Id));
+            if (name.Count == 0)
+            {
+                info.VertexElements[location].Name = InteropArray.ToUtf8("_" + input->Id);
+            }
+            else
+            {
+                info.VertexElements[location].Name = name.Clone();
+            }
+
+            CrossType* baseType = api1.CompilerGetTypeHandle(compiler, input->BaseTypeId);
+            CrossType* type = api1.CompilerGetTypeHandle(compiler, input->TypeId);
+            int vecsize = (int)api1.TypeGetVectorSize(baseType);
+            switch (api1.TypeGetBasetype(baseType))
+            {
+                case Basetype.FP32:
+                    info.VertexElements[location].Format = FloatFormats[vecsize];
+                    break;
+                case Basetype.Int32:
+                    info.VertexElements[location].Format = IntFormats[vecsize];
+                    break;
+                case Basetype.Uint32:
+                    info.VertexElements[location].Format = UIntFormats[vecsize];
+                    break;
+                default:
+                    throw new Exception("Unhandled SPIR-V vertex input data type.");
+            }
+        }
+    }
+    
+    private static void Check(this Result result, Context* context)
+    {
+        if (result != Result.Success)
+        {
+            byte* msg = api1.ContextGetLastErrorString(context);
+            throw new Exception(Util.UTF8.GetString(MemoryMarshal.CreateReadOnlySpanFromNullTerminated(msg)));
+        }
+    }
 }
-} // namespace Veldrid

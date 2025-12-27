@@ -8,7 +8,7 @@ namespace Veldrid.SPIRV
         public static Encoding UTF8 { get; } = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
 
         [return: NotNullIfNotNull(nameof(data))]
-        internal static unsafe string? GetString(byte* data, uint length)
+        internal static unsafe string? GetString(byte* data, nuint length)
         {
             if (data == null) { return null!; }
 

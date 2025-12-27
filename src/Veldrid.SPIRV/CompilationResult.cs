@@ -1,25 +1,31 @@
 ﻿using System;
-using System.Runtime.InteropServices;
 
 namespace Veldrid.SPIRV
 {
-    [StructLayout(LayoutKind.Sequential)]
-    internal unsafe struct CompilationResult
+    internal unsafe struct CompilationResult : IDisposable
     {
         public Bool32 Succeeded;
-        public InteropArray DataBuffers;
-        public ReflectionInfo ReflectionInfo;
+        public InteropArray<InteropArray<byte>> DataBuffers;
+        public ReflectionInfo Reflection;
 
-        public uint GetLength(uint index)
+        public CompilationResult(InteropArray<byte> buffer)
         {
-            if (index >= DataBuffers.Count) { throw new ArgumentOutOfRangeException(nameof(index)); }
-            return DataBuffers.Ref<InteropArray>(index).Count;
+            DataBuffers = new InteropArray<InteropArray<byte>>(1);
+            DataBuffers[0] = buffer;
         }
 
-        public void* GetData(uint index)
+        public CompilationResult(string value) : this(InteropArray.ToUtf8(value))
         {
-            if (index >= DataBuffers.Count) { throw new ArgumentOutOfRangeException(nameof(index)); }
-            return DataBuffers.Ref<InteropArray>(index).Data;
+        }
+
+        public readonly nuint GetLength(uint index) => DataBuffers[index].Count;
+
+        public readonly byte* GetData(uint index) => DataBuffers[index].Data;
+
+        public void Dispose()
+        {
+            DataBuffers.Dispose();
+            Reflection.Dispose();
         }
     }
 }

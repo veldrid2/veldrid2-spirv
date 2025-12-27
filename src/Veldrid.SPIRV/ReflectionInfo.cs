@@ -1,35 +1,52 @@
-using System.Runtime.InteropServices;
+using System;
 
 namespace Veldrid.SPIRV
 {
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    internal struct ReflectionInfo
+    internal struct ReflectionInfo : IDisposable
     {
-        public InteropArray VertexElements; // InteropArray<NativeVertexElementDescription>
-        public InteropArray ResourceLayouts; // InteropArray<NativeResourceLayoutDescription>
+        public InteropArray<NativeVertexElementDescription> VertexElements;
+        public InteropArray<NativeResourceLayoutDescription> ResourceLayouts;
+
+        public void Dispose()
+        {
+            VertexElements.Dispose();
+            ResourceLayouts.Dispose();
+        }
     }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    internal struct NativeVertexElementDescription
+    internal struct NativeVertexElementDescription : IDisposable
     {
-        public InteropArray Name; // InteropArray<byte>
+        public InteropArray<byte> Name;
         public VertexElementSemantic Semantic;
         public VertexElementFormat Format;
         public uint Offset;
+
+        public void Dispose()
+        {
+            Name.Dispose();
+        }
     }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    internal struct NativeResourceLayoutDescription
+    internal struct NativeResourceLayoutDescription : IDisposable
     {
-        public InteropArray ResourceElements; // InteropArray<NativeResourceElementDescription>
+        public InteropArray<NativeResourceElementDescription> ResourceElements;
+
+        public void Dispose()
+        {
+            ResourceElements.Dispose();
+        }
     }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    internal struct NativeResourceElementDescription
+    internal struct NativeResourceElementDescription : IDisposable
     {
-        public InteropArray Name; // InteropArray<byte>
+        public InteropArray<byte> Name;
         public ResourceKind Kind;
         public ShaderStages Stages;
         public ResourceLayoutElementOptions Options;
+
+        public void Dispose()
+        {
+            Name.Dispose();
+        }
     }
 }
