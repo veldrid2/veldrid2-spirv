@@ -1,14 +1,11 @@
-using System.Runtime.CompilerServices;
-using System.Text;
+using System;
 
 namespace Veldrid.SPIRV
 {
-    internal struct NativeMacroDefinition
+    internal struct NativeMacroDefinition : IDisposable
     {
-        public uint NameLength;
-        public NameArray Name;
-        public uint ValueLength;
-        public NameArray Value;
+        public InteropArray<byte> Name;
+        public InteropArray<byte> Value;
 
         public NativeMacroDefinition(MacroDefinition macroDefinition)
         {
@@ -16,32 +13,19 @@ namespace Veldrid.SPIRV
             {
                 throw new SpirvCompilationException($"MacroDefinition Name must be non-null.");
             }
-            if (macroDefinition.Name.Length > 128)
-            {
-                throw new SpirvCompilationException($"Macro names must be less than or equal to 128 characters.");
-            }
 
-            NameLength = (uint)Encoding.ASCII.GetBytes(macroDefinition.Name, Name);
+            Name = InteropArray.ToUtf8(macroDefinition.Name);
 
             if (!string.IsNullOrEmpty(macroDefinition.Value))
             {
-                if (macroDefinition.Value.Length > 128)
-                {
-                    throw new SpirvCompilationException($"Macro values must be less than or equal to 128 characters.");
-                }
-
-                ValueLength = (uint)Encoding.ASCII.GetBytes(macroDefinition.Value, Value);
-            }
-            else
-            {
-                ValueLength = 0;
+                Value = InteropArray.ToUtf8(macroDefinition.Value);
             }
         }
 
-        [InlineArray(128)]
-        internal struct NameArray
+        public void Dispose()
         {
-            private byte _e0;
+            Name.Dispose();
+            Value.Dispose();
         }
     }
 }

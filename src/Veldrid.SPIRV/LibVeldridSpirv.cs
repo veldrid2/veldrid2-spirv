@@ -738,7 +738,10 @@ internal static unsafe class LibVeldridSpirv
             for (uint i = 0; i < info.Macros.Count; i++)
             {
                 ref NativeMacroDefinition macro = ref info.Macros[i];
-                api2.CompileOptionsAddMacroDefinition(options, macro.Name, macro.NameLength, macro.Value, macro.ValueLength);
+                api2.CompileOptionsAddMacroDefinition(
+                    options,
+                    macro.Name.Data, macro.Name.Count,
+                    macro.Value.Data, macro.Value.Count);
             }
 
             return CompileGLSLToSPIRV(info, options);
