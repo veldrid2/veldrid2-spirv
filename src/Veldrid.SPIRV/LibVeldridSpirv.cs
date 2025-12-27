@@ -412,8 +412,8 @@ internal static unsafe class LibVeldridSpirv
             }
 
             uint fsId;
-            api1.CompilerBuildDummySamplerForCombinedImages(vsCompiler, &fsId);
-            api1.CompilerBuildCombinedImageSamplers(vsCompiler);
+            api1.CompilerBuildDummySamplerForCombinedImages(fsCompiler, &fsId);
+            api1.CompilerBuildCombinedImageSamplers(fsCompiler);
 
             CombinedImageSampler* fsSamplers;
             nuint fsSamplerSize;
@@ -436,7 +436,7 @@ internal static unsafe class LibVeldridSpirv
                 api1.CompilerSetName(vsCompiler, output->Id, newName.Data);
             }
 
-            api1.ResourcesGetResourceListForType(vsResources, ResourceType.StageInput, &resList, &resSize);
+            api1.ResourcesGetResourceListForType(fsResources, ResourceType.StageInput, &resList, &resSize);
             for (nuint i = 0; i < resSize; i++)
             {
                 ReflectedResource* input = &resList[i];
@@ -512,7 +512,7 @@ internal static unsafe class LibVeldridSpirv
         }
 
         byte* fsText;
-        api1.CompilerCompile(fsCompiler, &fsText);
+        api1.CompilerCompile(fsCompiler, &fsText).Check(context);
         string fsStr = Util.UTF8.GetString(MemoryMarshal.CreateReadOnlySpanFromNullTerminated(fsText));
 
         api1.ResourcesGetResourceListForType(fsResources, ResourceType.StorageBuffer, &tmpList, &bufCount);
