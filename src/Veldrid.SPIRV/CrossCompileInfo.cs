@@ -1,15 +1,16 @@
-﻿
+﻿using System;
+
 namespace Veldrid.SPIRV
 {
-    internal struct CrossCompileInfo
+    internal ref struct CrossCompileInfo
     {
         public CrossCompileTarget Target;
-        public Bool32 FixClipSpaceZ;
-        public Bool32 InvertY;
-        public Bool32 NormalizeResourceNames;
-        public InteropArray<SpecializationConstant> Specializations;
-        public InteropArray<uint> VertexShader;
-        public InteropArray<uint> FragmentShader;
-        public InteropArray<uint> ComputeShader;
+        public bool FixClipSpaceZ;
+        public bool InvertY;
+        public bool NormalizeResourceNames;
+        public ReadOnlySpan<SpecializationConstant> Specializations;
+        public ReadOnlySpan<uint> VertexShader;
+        public ReadOnlySpan<uint> FragmentShader;
+        public ReadOnlySpan<uint> ComputeShader;
     }
 }

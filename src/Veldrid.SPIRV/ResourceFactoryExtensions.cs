@@ -52,11 +52,11 @@ namespace Veldrid.SPIRV
                 vertexShaderDescription.ShaderBytes = EnsureSpirv(vertexShaderDescription);
                 fragmentShaderDescription.ShaderBytes = EnsureSpirv(fragmentShaderDescription);
 
-                return new Shader[]
-                {
+                return
+                [
                     factory.CreateShader(vertexShaderDescription),
                     factory.CreateShader(fragmentShaderDescription)
-                };
+                ];
             }
 
             CrossCompileTarget target = GetCompilationTarget(factory.BackendType);
@@ -84,7 +84,7 @@ namespace Veldrid.SPIRV
                 fragmentBytes,
                 fragmentEntryPoint));
 
-            return new Shader[] { vertexShader, fragmentShader };
+            return [vertexShader, fragmentShader];
         }
 
         /// <summary>
@@ -136,33 +136,27 @@ namespace Veldrid.SPIRV
                 ? "main0"
                 : computeShaderDescription.EntryPoint;
             byte[] computeBytes = GetBytes(backend, compilationResult.ComputeShader);
+
             return factory.CreateShader(new ShaderDescription(
                 computeShaderDescription.Stage,
                 computeBytes,
                 computeEntryPoint));
         }
 
-        private static unsafe byte[] EnsureSpirv(ShaderDescription description)
+        private static byte[] EnsureSpirv(ShaderDescription description)
         {
             if (Util.HasSpirvHeader(description.ShaderBytes))
             {
                 return description.ShaderBytes;
             }
-            else
-            {
-                fixed (byte* sourceAsciiPtr = description.ShaderBytes)
-                {
-                    SpirvCompilationResult glslCompileResult = SpirvCompilation.CompileGlslToSpirv(
-                        (uint)description.ShaderBytes.Length,
-                        sourceAsciiPtr,
-                        null,
-                        description.Stage,
-                        description.Debug,
-                        0,
-                        null);
-                    return glslCompileResult.SpirvBytes;
-                }
-            }
+
+            SpirvCompilationResult glslCompileResult = SpirvCompilation.CompileGlslToSpirv(
+                description.ShaderBytes,
+                string.Empty,
+                description.Stage,
+                description.Debug,
+                default);
+            return glslCompileResult.SpirvBytes;
         }
 
         [SuppressMessage("Style", "IDE0066:Convert switch statement to expression", Justification = "<Pending>")]

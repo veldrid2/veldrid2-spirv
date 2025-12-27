@@ -9,6 +9,8 @@ using Silk.NET.SPIRV.Cross;
 namespace Veldrid.SPIRV;
 
 using CrossCompiler = Silk.NET.SPIRV.Cross.Compiler;
+using SpvcConstant = Silk.NET.SPIRV.Cross.SpecializationConstant;
+
 using ShaderCompiler = Silk.NET.Shaderc.Compiler;
 
 readonly record struct BindingInfo(uint Set, uint Binding);
@@ -34,8 +36,8 @@ internal static unsafe class LibVeldridSpirv
     private static ResourceKind ClassifyResource(CrossCompiler* compiler, in ReflectedResource resource, bool image, bool storage)
     {
         CrossType* type = api1.CompilerGetTypeHandle(compiler, resource.TypeId);
-        
-        // TODO: what's this for?
+
+        // TODO: what's this for? was it meant for CompilerGetBufferBlockDecorations?
         uint nonWritable = api1.CompilerGetDecoration(compiler, resource.Id, Decoration.NonWritable);
 
         switch (api1.TypeGetBasetype(type))
@@ -79,8 +81,8 @@ internal static unsafe class LibVeldridSpirv
         Dictionary<BindingInfo, ResourceInfo> allResources,
         int idIndex,
         bool normalizeResourceNames,
-        bool image = false,
-        bool storage = false)
+        bool image,
+        bool storage)
     {
         ReflectedResource* resourceList;
         nuint resource_size;
@@ -88,7 +90,7 @@ internal static unsafe class LibVeldridSpirv
 
         for (nuint i = 0; i < resource_size; i++)
         {
-            ReflectedResource res = resourceList[i];
+            ref ReflectedResource res = ref resourceList[i];
             ResourceKind kind = ClassifyResource(compiler, res, image, storage);
             BindingInfo bi = new(
                 api1.CompilerGetDecoration(compiler, res.Id, Decoration.DescriptorSet),
@@ -99,14 +101,8 @@ internal static unsafe class LibVeldridSpirv
             if (normalizeResourceNames)
             {
                 InteropArray<byte> name = InteropArray.ToUtf8($"vdspv_{bi.Set}_{bi.Binding}");
-                if (kind == ResourceKind.UniformBuffer)
-                {
-                    api1.CompilerSetName(compiler, res.BaseTypeId, name.Data);
-                }
-                else
-                {
-                    api1.CompilerSetName(compiler, res.Id, name.Data);
-                }
+                uint id = kind == ResourceKind.UniformBuffer ? res.BaseTypeId : res.Id;
+                api1.CompilerSetName(compiler, id, name.Data);
                 ri.Name = name;
             }
             else
@@ -125,72 +121,61 @@ internal static unsafe class LibVeldridSpirv
 
             if (actualRi.IDs[idIndex] != 0)
             {
-                string msg = $"The same binding slot ({bi.Set}, {bi.Binding}) was used by multiple distinct resources. First resource: {InteropArray.ToString(actualRi.Name)}. Second resource: {InteropArray.ToString(ri.Name)}";
+                string msg =
+                    $"The same binding slot ({bi.Set}, {bi.Binding}) was used by multiple distinct resources. " +
+                    $"First resource: {InteropArray.ToString(actualRi.Name)}. Second resource: {InteropArray.ToString(ri.Name)}";
                 throw new Exception(msg);
             }
 
             actualRi.IDs[idIndex] = res.Id;
             if (actualRi.Kind != kind)
             {
-                string msg = $"The same binding slot ({bi.Set}, {bi.Binding}) was used by multiple resources with incompatible types: \"{actualRi.Kind}\" and \"{kind}\".";
+                string msg =
+                    $"The same binding slot ({bi.Set}, {bi.Binding}) was used by multiple resources " +
+                    $"with incompatible types: \"{actualRi.Kind}\" and \"{kind}\".";
                 throw new Exception(msg);
             }
         }
     }
 
+    private static void AddAllResources(
+        Resources* resources,
+        CrossCompiler* compiler,
+        Dictionary<BindingInfo, ResourceInfo> map,
+        int idIndex,
+        bool normalizeResourceNames)
+    {
+        AddResources(resources, ResourceType.UniformBuffer, compiler, map, idIndex, normalizeResourceNames, false, false);
+        AddResources(resources, ResourceType.StorageBuffer, compiler, map, idIndex, normalizeResourceNames, false, true);
+        AddResources(resources, ResourceType.SeparateImage, compiler, map, idIndex, normalizeResourceNames, true, false);
+        AddResources(resources, ResourceType.StorageImage, compiler, map, idIndex, normalizeResourceNames, true, true);
+        AddResources(resources, ResourceType.SeparateSamplers, compiler, map, idIndex, normalizeResourceNames, false, false);
+    }
+
+    private struct ResourceCounter
+    {
+        public uint BufferIndex;
+        public uint TextureIndex;
+        public uint UavIndex;
+        public uint SamplerIndex;
+    }
 
     private static uint GetResourceIndex(
         CrossCompileTarget target,
         ResourceKind resourceKind,
-        ref uint bufferIndex,
-        ref uint textureIndex,
-        ref uint uavIndex,
-        ref uint samplerIndex)
+        ref ResourceCounter counter)
     {
-        switch (resourceKind)
+        bool isMSL = target == CrossCompileTarget.MSL;
+        return resourceKind switch
         {
-            case ResourceKind.UniformBuffer:
-                return bufferIndex++;
-
-            case ResourceKind.StructuredBufferReadWrite:
-                if (target == CrossCompileTarget.MSL)
-                {
-                    return bufferIndex++;
-                }
-                else
-                {
-                    return uavIndex++;
-                }
-
-            case ResourceKind.TextureReadWrite:
-                if (target == CrossCompileTarget.MSL)
-                {
-                    return textureIndex++;
-                }
-                else
-                {
-                    return uavIndex++;
-                }
-
-            case ResourceKind.TextureReadOnly:
-                return textureIndex++;
-
-            case ResourceKind.StructuredBufferReadOnly:
-                if (target == CrossCompileTarget.MSL)
-                {
-                    return bufferIndex++;
-                }
-                else
-                {
-                    return textureIndex++;
-                }
-
-            case ResourceKind.Sampler:
-                return samplerIndex++;
-
-            default:
-                throw new ArgumentException("Invalid ResourceKind.");
-        }
+            ResourceKind.UniformBuffer => counter.BufferIndex++,
+            ResourceKind.StructuredBufferReadWrite => isMSL ? counter.BufferIndex++ : counter.UavIndex++,
+            ResourceKind.TextureReadWrite => isMSL ? counter.TextureIndex++ : counter.UavIndex++,
+            ResourceKind.TextureReadOnly => counter.TextureIndex++,
+            ResourceKind.StructuredBufferReadOnly => isMSL ? counter.BufferIndex++ : counter.TextureIndex++,
+            ResourceKind.Sampler => counter.SamplerIndex++,
+            _ => throw new ArgumentException("Invalid ResourceKind."),
+        };
     }
 
     private static CrossCompiler* GetCompiler(Context* context, ParsedIr* ir, in CrossCompileInfo info)
@@ -220,7 +205,7 @@ internal static unsafe class LibVeldridSpirv
                 api1.CompilerOptionsSetBool(options, CompilerOption.GlslEnable420PackExtension, 0);
 
                 uint version;
-                if (info.ComputeShader.Count > 0)
+                if (!info.ComputeShader.IsEmpty)
                 {
                     version = info.Target == CrossCompileTarget.GLSL ? 430u : 310;
                 }
@@ -252,19 +237,18 @@ internal static unsafe class LibVeldridSpirv
 
     private static void SetSpecializations(CrossCompiler* compiler, in CrossCompileInfo info)
     {
-        Silk.NET.SPIRV.Cross.SpecializationConstant* specConstants;
+        SpvcConstant* specConstants;
         nuint num_constants;
         api1.CompilerGetSpecializationConstants(compiler, &specConstants, &num_constants);
 
-        for (nuint i = 0; i < info.Specializations.Count; i++)
+        foreach (SpecializationConstant spec in info.Specializations)
         {
-            uint constID = info.Specializations[i].ID;
             uint varID = 0;
 
             for (nuint j = 0; j < num_constants; j++)
             {
-                var constant = specConstants[j];
-                if (constant.ConstantId == constID)
+                SpvcConstant constant = specConstants[j];
+                if (constant.ConstantId == spec.ID)
                 {
                     varID = constant.Id;
                 }
@@ -272,8 +256,8 @@ internal static unsafe class LibVeldridSpirv
 
             if (varID != 0)
             {
-                var constVar = api1.CompilerGetConstantHandle(compiler, varID);
-                api1.ConstantSetScalarU64(constVar, 0, 0, info.Specializations[i].Data);
+                Constant* constVar = api1.CompilerGetConstantHandle(compiler, varID);
+                api1.ConstantSetScalarU64(constVar, 0, 0, spec.Data);
             }
         }
     }
@@ -282,7 +266,7 @@ internal static unsafe class LibVeldridSpirv
         Dictionary<BindingInfo, ResourceInfo> resources,
         bool compute)
     {
-        List<uint> setSizes = new();
+        List<uint> setSizes = [];
         foreach (BindingInfo it in resources.Keys)
         {
             uint set = it.Set;
@@ -298,13 +282,16 @@ internal static unsafe class LibVeldridSpirv
 
         for (int i = 0; i < setCount; i++)
         {
-            ret[i].ResourceElements = new(setSizes[i]);
+            ret[i].ResourceElements = new InteropArray<NativeResourceElementDescription>(setSizes[i]);
             for (int j = 0; j < setSizes[i]; j++)
             {
-                ret[i].ResourceElements[j].Name = new InteropArray<byte>();
-                ret[i].ResourceElements[j].Kind = ResourceKind.UniformBuffer;
-                ret[i].ResourceElements[j].Stages = ShaderStages.None;
-                ret[i].ResourceElements[j].Options = ResourceLayoutElementOptions.Unused;
+                ret[i].ResourceElements[j] = new NativeResourceElementDescription()
+                {
+                    Name = default,
+                    Kind = ResourceKind.UniformBuffer,
+                    Stages = ShaderStages.None,
+                    Options = ResourceLayoutElementOptions.Unused,
+                };
             }
         }
 
@@ -313,40 +300,33 @@ internal static unsafe class LibVeldridSpirv
             ShaderStages stages = ShaderStages.None;
             if (it.Value.IDs[0] != 0)
             {
-                if (compute)
-                {
-                    stages |= ShaderStages.Compute;
-                }
-                else
-                {
-                    stages |= ShaderStages.Vertex;
-                }
+                stages |= compute ? ShaderStages.Compute : ShaderStages.Vertex;
             }
             if (it.Value.IDs[1] != 0)
             {
                 stages |= ShaderStages.Fragment;
             }
 
-            ret[it.Key.Set].ResourceElements[it.Key.Binding].Name = it.Value.Name;
-            ret[it.Key.Set].ResourceElements[it.Key.Binding].Kind = it.Value.Kind;
-            ret[it.Key.Set].ResourceElements[it.Key.Binding].Stages = stages;
-            ret[it.Key.Set].ResourceElements[it.Key.Binding].Options = 0;
+            ret[it.Key.Set].ResourceElements[it.Key.Binding] = new NativeResourceElementDescription()
+            {
+                Name = it.Value.Name,
+                Kind = it.Value.Kind,
+                Stages = stages,
+                Options = 0,
+            };
         }
 
         return ret;
     }
 
-    private static CompilationResult CompileVertexFragment(in CrossCompileInfo info)
+    private static CompilationResult CompileVertexFragment(Context* context, in CrossCompileInfo info)
     {
-        Context* context;
-        api1.ContextCreate(&context);
-
         ParsedIr* vsBytes;
-        api1.ContextParseSpirv(context, info.VertexShader.Data, info.VertexShader.Count, &vsBytes).Check(context);
+        api1.ContextParseSpirv(context, info.VertexShader, (uint)info.VertexShader.Length, &vsBytes).Check(context);
         CrossCompiler* vsCompiler = GetCompiler(context, vsBytes, info);
 
         ParsedIr* fsBytes;
-        api1.ContextParseSpirv(context, info.FragmentShader.Data, info.FragmentShader.Count, &fsBytes).Check(context);
+        api1.ContextParseSpirv(context, info.FragmentShader, (uint)info.FragmentShader.Length, &fsBytes).Check(context);
         CrossCompiler* fsCompiler = GetCompiler(context, fsBytes, info);
 
         SetSpecializations(vsCompiler, info);
@@ -357,41 +337,27 @@ internal static unsafe class LibVeldridSpirv
         Resources* fsResources;
         api1.CompilerCreateShaderResources(fsCompiler, &fsResources);
 
-        Dictionary<BindingInfo, ResourceInfo> allResources = new();
+        using OwnedMap<BindingInfo, ResourceInfo> allResources = new([]);
 
-        AddResources(vsResources, ResourceType.UniformBuffer, vsCompiler, allResources, 0, info.NormalizeResourceNames);
-        AddResources(vsResources, ResourceType.StorageBuffer, vsCompiler, allResources, 0, info.NormalizeResourceNames, false, true);
-        AddResources(vsResources, ResourceType.SeparateImage, vsCompiler, allResources, 0, info.NormalizeResourceNames, true, false);
-        AddResources(vsResources, ResourceType.StorageImage, vsCompiler, allResources, 0, info.NormalizeResourceNames, true, true);
-        AddResources(vsResources, ResourceType.SeparateSamplers, vsCompiler, allResources, 0, info.NormalizeResourceNames);
-
-        AddResources(fsResources, ResourceType.UniformBuffer, fsCompiler, allResources, 1, info.NormalizeResourceNames);
-        AddResources(fsResources, ResourceType.StorageBuffer, fsCompiler, allResources, 1, info.NormalizeResourceNames, false, true);
-        AddResources(fsResources, ResourceType.SeparateImage, fsCompiler, allResources, 1, info.NormalizeResourceNames, true, false);
-        AddResources(fsResources, ResourceType.StorageImage, fsCompiler, allResources, 1, info.NormalizeResourceNames, true, true);
-        AddResources(fsResources, ResourceType.SeparateSamplers, fsCompiler, allResources, 1, info.NormalizeResourceNames);
+        AddAllResources(vsResources, vsCompiler, allResources.Map, 0, info.NormalizeResourceNames);
+        AddAllResources(fsResources, fsCompiler, allResources.Map, 1, info.NormalizeResourceNames);
 
         if (info.Target == CrossCompileTarget.HLSL || info.Target == CrossCompileTarget.MSL)
         {
-            uint bufferIndex = 0;
-            uint textureIndex = 0;
-            uint uavIndex = 0;
-            uint samplerIndex = 0;
-            foreach (ResourceInfo it in allResources.Values)
+            ResourceCounter counter = new();
+            foreach (ResourceInfo it in allResources.Map.Values)
             {
-                uint index = GetResourceIndex(
-                    info.Target, it.Kind, ref bufferIndex, ref textureIndex, ref uavIndex, ref samplerIndex);
-
+                uint index = GetResourceIndex(info.Target, it.Kind, ref counter);
                 uint vsID = it.IDs[0];
                 if (vsID != 0)
                 {
-                    api1.CompilerSetDecoration(vsCompiler, vsID, Silk.NET.SPIRV.Decoration.Binding, index);
+                    api1.CompilerSetDecoration(vsCompiler, vsID, Decoration.Binding, index);
                 }
 
                 uint fsID = it.IDs[1];
                 if (fsID != 0)
                 {
-                    api1.CompilerSetDecoration(fsCompiler, fsID, Silk.NET.SPIRV.Decoration.Binding, index);
+                    api1.CompilerSetDecoration(fsCompiler, fsID, Decoration.Binding, index);
                 }
             }
         }
@@ -432,7 +398,7 @@ internal static unsafe class LibVeldridSpirv
                 ReflectedResource* output = &resList[i];
 
                 uint location = api1.CompilerGetDecoration(vsCompiler, output->Id, Decoration.Location);
-                using var newName = InteropArray.ToUtf8($"vdspv_fsin{location}");
+                using InteropArray<byte> newName = InteropArray.ToUtf8($"vdspv_fsin{location}");
                 api1.CompilerSetName(vsCompiler, output->Id, newName.Data);
             }
 
@@ -442,7 +408,7 @@ internal static unsafe class LibVeldridSpirv
                 ReflectedResource* input = &resList[i];
 
                 uint location = api1.CompilerGetDecoration(fsCompiler, input->Id, Decoration.Location);
-                using var newName = InteropArray.ToUtf8($"vdspv_fsin{location}");
+                using InteropArray<byte> newName = InteropArray.ToUtf8($"vdspv_fsin{location}");
                 api1.CompilerSetName(fsCompiler, input->Id, newName.Data);
             }
         }
@@ -460,7 +426,7 @@ internal static unsafe class LibVeldridSpirv
 
             uint bufferIndex = 0;
             uint imageIndex = 0;
-            foreach (var it in allResources.Values)
+            foreach (ResourceInfo it in allResources.Map.Values)
             {
                 if (it.Kind == ResourceKind.StructuredBufferReadOnly || it.Kind == ResourceKind.StructuredBufferReadWrite)
                 {
@@ -469,6 +435,7 @@ internal static unsafe class LibVeldridSpirv
                     {
                         api1.CompilerSetDecoration(vsCompiler, it.IDs[0], Decoration.Binding, id);
                     }
+
                     if (it.IDs[1] != 0)
                     {
                         api1.CompilerSetDecoration(fsCompiler, it.IDs[1], Decoration.Binding, id);
@@ -481,6 +448,7 @@ internal static unsafe class LibVeldridSpirv
                     {
                         api1.CompilerSetDecoration(vsCompiler, it.IDs[0], Decoration.Binding, id);
                     }
+
                     if (it.IDs[1] != 0)
                     {
                         api1.CompilerSetDecoration(fsCompiler, it.IDs[1], Decoration.Binding, id);
@@ -530,29 +498,24 @@ internal static unsafe class LibVeldridSpirv
             fsStr = fsStr.Replace(key, "#version 310");
         }
 
-        CompilationResult result = new CompilationResult();
-        result.Succeeded = true;
-
-        result.DataBuffers = new InteropArray<InteropArray<byte>>(2);
+        CompilationResult result = new()
+        {
+            Succeeded = true,
+            DataBuffers = new InteropArray<InteropArray<byte>>(2)
+        };
         result.DataBuffers[0] = InteropArray.ToUtf8(vsStr);
         result.DataBuffers[1] = InteropArray.ToUtf8(fsStr);
 
         ReflectVertexInfo(vsCompiler, vsResources, ref result.Reflection);
-        result.Reflection.ResourceLayouts = CreateResourceLayoutArray(allResources, false);
-
-        //delete vsCompiler;
-        //delete fsCompiler;
+        result.Reflection.ResourceLayouts = CreateResourceLayoutArray(allResources.Map, false);
 
         return result;
     }
 
-    private static CompilationResult CompileCompute(in CrossCompileInfo info)
+    private static CompilationResult CompileCompute(Context* context, in CrossCompileInfo info)
     {
-        Context* context;
-        api1.ContextCreate(&context);
-
         ParsedIr* csBytes;
-        api1.ContextParseSpirv(context, info.ComputeShader.Data, info.ComputeShader.Count, &csBytes).Check(context);
+        api1.ContextParseSpirv(context, info.ComputeShader, (uint)info.ComputeShader.Length, &csBytes).Check(context);
         CrossCompiler* csCompiler = GetCompiler(context, csBytes, info);
 
         SetSpecializations(csCompiler, info);
@@ -560,24 +523,16 @@ internal static unsafe class LibVeldridSpirv
         Resources* csResources;
         api1.CompilerCreateShaderResources(csCompiler, &csResources);
 
-        Dictionary<BindingInfo, ResourceInfo> allResources = new();
+        using OwnedMap<BindingInfo, ResourceInfo> allResources = new([]);
 
-        AddResources(csResources, ResourceType.UniformBuffer, csCompiler, allResources, 0, info.NormalizeResourceNames);
-        AddResources(csResources, ResourceType.StorageBuffer, csCompiler, allResources, 0, info.NormalizeResourceNames, false, true);
-        AddResources(csResources, ResourceType.SeparateImage, csCompiler, allResources, 0, info.NormalizeResourceNames, true, false);
-        AddResources(csResources, ResourceType.StorageImage, csCompiler, allResources, 0, info.NormalizeResourceNames, true, true);
-        AddResources(csResources, ResourceType.SeparateSamplers, csCompiler, allResources, 0, info.NormalizeResourceNames);
+        AddAllResources(csResources, csCompiler, allResources.Map, 0, info.NormalizeResourceNames);
 
         if (info.Target == CrossCompileTarget.HLSL || info.Target == CrossCompileTarget.MSL)
         {
-            uint bufferIndex = 0;
-            uint textureIndex = 0;
-            uint uavIndex = 0;
-            uint samplerIndex = 0;
-            foreach (ResourceInfo it in allResources.Values)
+            ResourceCounter counter = new();
+            foreach (ResourceInfo it in allResources.Map.Values)
             {
-                uint index = GetResourceIndex(info.Target, it.Kind, ref bufferIndex, ref textureIndex, ref uavIndex, ref samplerIndex);
-
+                uint index = GetResourceIndex(info.Target, it.Kind, ref counter);
                 uint csID = it.IDs[0];
                 if (csID != 0)
                 {
@@ -615,8 +570,9 @@ internal static unsafe class LibVeldridSpirv
 
             uint bufferIndex = 0;
             uint imageIndex = 0;
-            foreach (ResourceInfo it in allResources.Values)
+            foreach (ResourceInfo it in allResources.Map.Values)
             {
+                // TODO: check if IDs is zero like elsewhere?
                 if (it.Kind == ResourceKind.StructuredBufferReadOnly || it.Kind == ResourceKind.StructuredBufferReadWrite)
                 {
                     api1.CompilerSetDecoration(csCompiler, it.IDs[0], Decoration.Binding, bufferIndex++);
@@ -631,91 +587,77 @@ internal static unsafe class LibVeldridSpirv
         byte* csText;
         api1.CompilerCompile(csCompiler, &csText).Check(context);
 
-        CompilationResult result = new(InteropArray.FromNullTerminated(csText).Clone())
+        CompilationResult result = new(InteropArray.FromNullTerminated(csText))
         {
             Succeeded = true,
         };
-        result.Reflection.ResourceLayouts = CreateResourceLayoutArray(allResources, true);
+        result.Reflection.ResourceLayouts = CreateResourceLayoutArray(allResources.Map, true);
 
         return result;
     }
 
-    public static CompilationResult Compile(in CrossCompileInfo info)
+    public static CompilationResult Compile(Context* context, in CrossCompileInfo info)
     {
-        if (info.VertexShader.Count > 0 && info.FragmentShader.Count > 0)
+        if (!info.VertexShader.IsEmpty && !info.FragmentShader.IsEmpty)
         {
-            return CompileVertexFragment(info);
+            return CompileVertexFragment(context, info);
         }
-        else if (info.ComputeShader.Count > 0)
+        else if (!info.ComputeShader.IsEmpty)
         {
-            return CompileCompute(info);
+            return CompileCompute(context, info);
         }
 
         return new CompilationResult("The given combination of shaders was not valid.");
     }
-
-    /*
-    std::vector<uint32_t> ReadFile(std::string path)
-    {
-        std::ifstream is(path, std::ios::binary | std::ios::in | std::ios::ate);
-        size_t size = is.tellg();
-        is.seekg(0, std::ios::beg);
-        char *shaderCode = new char[size];
-        is.read(shaderCode, size);
-        is.close();
-
-        std::vector<uint32_t> ret(size / 4);
-        memcpy(ret.data(), shaderCode, size);
-
-        delete[] shaderCode;
-        return ret;
-    }
-
-    void WriteToFile(const std::string &path, const std::string &text)
-    {
-        auto outFile = std::ofstream(path);
-        outFile << text;
-        outFile.close();
-    }
-    */
 
     public static CompilationResult CompileGLSLToSPIRV(in GlslCompileInfo info, CompileOptions* options)
     {
         ShaderCompiler* compiler = api2.CompilerInitialize();
         Silk.NET.Shaderc.CompilationResult* res = api2.CompileIntoSpv(
             compiler,
-            info.SourceText.Data,
-            info.SourceText.Count,
+            info.SourceText,
+            (uint)info.SourceText.Length,
             info.Kind,
-            info.FileName.Data,
+            info.FileName,
             "main\0"u8,
             options);
-
-        if (api2.ResultGetCompilationStatus(res) != CompilationStatus.Success)
+        try
         {
-            InteropArray<byte> msg = InteropArray.FromNullTerminated(api2.ResultGetErrorMessage(res));
-            return new CompilationResult(msg.Clone());
+            if (api2.ResultGetCompilationStatus(res) != CompilationStatus.Success)
+            {
+                // TODO: differentiate error types/results
+                InteropArray<byte> msg = InteropArray.FromNullTerminated(api2.ResultGetErrorMessage(res));
+                return new CompilationResult(msg);
+            }
+
+            InteropArray<byte> array = new(
+                api2.ResultGetLength(res),
+                api2.ResultGetBytes(res));
+
+            return new CompilationResult(array) { Succeeded = true };
         }
-
-        InteropArray<byte> array = new(
-            api2.ResultGetLength(res),
-            api2.ResultGetBytes(res));
-
-        return new CompilationResult(array.Clone()) { Succeeded = true };
-
-        //api2.ResultRelease(res);
-        //api2.CompilerRelease(compiler);
+        finally
+        {
+            api2.ResultRelease(res);
+            api2.CompilerRelease(compiler);
+        }
     }
 
     public static CompilationResult CrossCompile(in CrossCompileInfo info)
     {
+        Context* context;
+        api1.ContextCreate(&context);
         try
         {
-            return Compile(info);
+            return Compile(context, info);
         }
         catch (Exception ex)
         {
             return new CompilationResult(ex.ToString());
+        }
+        finally
+        {
+            api1.ContextDestroy(context);
         }
     }
 
@@ -735,9 +677,8 @@ internal static unsafe class LibVeldridSpirv
                 api2.CompileOptionsSetOptimizationLevel(options, OptimizationLevel.Performance);
             }
 
-            for (uint i = 0; i < info.Macros.Count; i++)
+            foreach (ref readonly NativeMacroDefinition macro in info.Macros)
             {
-                ref NativeMacroDefinition macro = ref info.Macros[i];
                 api2.CompileOptionsAddMacroDefinition(
                     options,
                     macro.Name.Data, macro.Name.Count,
@@ -746,14 +687,14 @@ internal static unsafe class LibVeldridSpirv
 
             return CompileGLSLToSPIRV(info, options);
         }
-        catch (Exception e)
+        catch (Exception ex)
         {
-            return new CompilationResult(e.ToString());
+            return new CompilationResult(ex.ToString());
         }
-        //finally
-        //{
-        //    api2.CompileOptionsRelease(options);
-        //}
+        finally
+        {
+            api2.CompileOptionsRelease(options);
+        }
     }
 
     private static ReadOnlySpan<VertexElementFormat> FloatFormats =>
@@ -806,35 +747,21 @@ internal static unsafe class LibVeldridSpirv
             uint location = api1.CompilerGetDecoration(compiler, input->Id, Decoration.Location);
             info.VertexElements[location].Semantic = VertexElementSemantic.TextureCoordinate;
             InteropArray<byte> name = InteropArray.FromNullTerminated(api1.CompilerGetName(compiler, input->Id));
-            if (name.Count == 0)
-            {
-                info.VertexElements[location].Name = InteropArray.ToUtf8("_" + input->Id);
-            }
-            else
-            {
-                info.VertexElements[location].Name = name.Clone();
-            }
+            info.VertexElements[location].Name = name.Count == 0 ? InteropArray.ToUtf8("_" + input->Id) : name.Clone();
 
             CrossType* baseType = api1.CompilerGetTypeHandle(compiler, input->BaseTypeId);
             CrossType* type = api1.CompilerGetTypeHandle(compiler, input->TypeId);
             int vecsize = (int)api1.TypeGetVectorSize(baseType);
-            switch (api1.TypeGetBasetype(baseType))
+            info.VertexElements[location].Format = api1.TypeGetBasetype(baseType) switch
             {
-                case Basetype.FP32:
-                    info.VertexElements[location].Format = FloatFormats[vecsize];
-                    break;
-                case Basetype.Int32:
-                    info.VertexElements[location].Format = IntFormats[vecsize];
-                    break;
-                case Basetype.Uint32:
-                    info.VertexElements[location].Format = UIntFormats[vecsize];
-                    break;
-                default:
-                    throw new Exception("Unhandled SPIR-V vertex input data type.");
-            }
+                Basetype.FP32 => FloatFormats[vecsize],
+                Basetype.Int32 => IntFormats[vecsize],
+                Basetype.Uint32 => UIntFormats[vecsize],
+                _ => throw new Exception("Unhandled SPIR-V vertex input data type."),
+            };
         }
     }
-    
+
     private static void Check(this Result result, Context* context)
     {
         if (result != Result.Success)

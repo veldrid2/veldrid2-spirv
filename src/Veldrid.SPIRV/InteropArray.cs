@@ -18,11 +18,11 @@ namespace Veldrid.SPIRV
 
         public InteropArray(nuint count)
         {
-            Data = (T*) NativeMemory.AllocZeroed(checked(count * (uint) sizeof(T)));
+            Data = (T*)NativeMemory.AllocZeroed(checked(count * (uint)sizeof(T)));
             Count = count;
         }
 
-        public readonly nuint ByteCount => checked(Count * (uint) sizeof(T));
+        public readonly nuint ByteCount => checked(Count * (uint)sizeof(T));
 
         public readonly ref T this[nuint index]
         {
@@ -36,13 +36,13 @@ namespace Veldrid.SPIRV
             }
         }
 
-        public readonly ref T this[int index] => ref this[(uint) index];
+        public readonly ref T this[int index] => ref this[(uint)index];
 
-        public readonly ref T Ref(int index) => ref this[(uint) index];
+        public readonly ref T Ref(int index) => ref this[(uint)index];
 
-        public readonly ref T Ref(nuint index) => ref this[(uint) index];
+        public readonly ref T Ref(nuint index) => ref this[(uint)index];
 
-        public readonly Span<T> AsSpan() => new(Data, checked((int) Count));
+        public readonly Span<T> AsSpan() => new(Data, checked((int)Count));
 
         public readonly InteropArray<T> Clone()
         {
@@ -50,18 +50,34 @@ namespace Veldrid.SPIRV
             {
                 return this;
             }
-            var result = new InteropArray<T>(Count);
+
+            InteropArray<T> result = new(Count);
             NativeMemory.Copy(Data, result.Data, ByteCount);
             return result;
         }
 
         public void Dispose()
         {
-            if (Data != null)
+            if (Data == null)
             {
-                NativeMemory.Free(Data);
-                Data = null;
-                Count = 0;
+                return;
+            }
+
+            if (default(T) is IDisposable)
+            {
+                DisposeItems();
+            }
+
+            NativeMemory.Free(Data);
+            Data = null;
+            Count = 0;
+        }
+
+        private void DisposeItems()
+        {
+            for (nuint i = 0; i < Count; i++)
+            {
+                ((IDisposable)Data[i]).Dispose();
             }
         }
 
@@ -74,7 +90,7 @@ namespace Veldrid.SPIRV
         public static InteropArray<T> Clone<T>(ReadOnlySpan<T> span)
             where T : unmanaged
         {
-            InteropArray<T> result = new((uint) span.Length);
+            InteropArray<T> result = new((uint)span.Length);
             unsafe
             {
                 span.CopyTo(new Span<T>(result.Data, span.Length));
@@ -90,15 +106,15 @@ namespace Veldrid.SPIRV
             {
                 throw new ArgumentException();
             }
-            return new InteropArray<byte>((uint) length, ptr);
+            return new InteropArray<byte>((uint)length, ptr);
         }
 
         public static unsafe InteropArray<byte> ToUtf8(ReadOnlySpan<char> value)
         {
-            uint count = (uint) Util.UTF8.GetByteCount(value);
-            var array = new InteropArray<byte>(count + 1);
+            uint count = (uint)Util.UTF8.GetByteCount(value);
+            InteropArray<byte> array = new(count + 1);
             Util.UTF8.GetBytes(value, array.AsSpan());
-            array[count] = (byte) '\0';
+            array[count] = (byte)'\0';
             return new InteropArray<byte>(count, array.Data);
         }
 
@@ -106,7 +122,7 @@ namespace Veldrid.SPIRV
         {
             unsafe
             {
-                return Util.UTF8.GetString(array.Data, checked((int) array.Count));
+                return Util.UTF8.GetString(array.Data, checked((int)array.Count));
             }
         }
     }

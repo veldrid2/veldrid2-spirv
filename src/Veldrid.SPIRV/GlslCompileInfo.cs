@@ -1,13 +1,14 @@
-﻿using Silk.NET.Shaderc;
+﻿using System;
+using Silk.NET.Shaderc;
 
 namespace Veldrid.SPIRV
 {
-    internal unsafe struct GlslCompileInfo
+    internal ref struct GlslCompileInfo
     {
-        public InteropArray<byte> SourceText;
-        public InteropArray<byte> FileName;
+        public ReadOnlySpan<byte> SourceText;
+        public ReadOnlySpan<byte> FileName;
+        public ReadOnlySpan<NativeMacroDefinition> Macros;
         public ShaderKind Kind;
-        public Bool32 Debug;
-        public InteropArray<NativeMacroDefinition> Macros;
+        public bool Debug;
     };
 }
