@@ -13,7 +13,17 @@ using SpvcConstant = Silk.NET.SPIRV.Cross.SpecializationConstant;
 
 using ShaderCompiler = Silk.NET.Shaderc.Compiler;
 
-readonly record struct BindingInfo(uint Set, uint Binding);
+readonly record struct BindingInfo(uint Set, uint Binding) : IComparable<BindingInfo>
+{
+    public int CompareTo(BindingInfo other)
+    {
+        if (Set != other.Set)
+        {
+            return Set.CompareTo(other.Set);
+        }
+        return Binding.CompareTo(other.Binding);
+    }
+}
 
 struct ResourceInfo
 {
@@ -345,8 +355,10 @@ internal static unsafe class LibVeldridSpirv
         if (info.Target == CrossCompileTarget.HLSL || info.Target == CrossCompileTarget.MSL)
         {
             ResourceCounter counter = new();
-            foreach (ResourceInfo it in allResources.Map.Values)
+            foreach (OwnedMap<BindingInfo, ResourceInfo>.Pair pair in allResources)
             {
+                ref ResourceInfo it = ref pair.Value;
+
                 uint index = GetResourceIndex(info.Target, it.Kind, ref counter);
                 uint vsID = it.IDs[0];
                 if (vsID != 0)
@@ -426,8 +438,9 @@ internal static unsafe class LibVeldridSpirv
 
             uint bufferIndex = 0;
             uint imageIndex = 0;
-            foreach (ResourceInfo it in allResources.Map.Values)
+            foreach (OwnedMap<BindingInfo, ResourceInfo>.Pair pair in allResources)
             {
+                ref ResourceInfo it = ref pair.Value;
                 if (it.Kind == ResourceKind.StructuredBufferReadOnly || it.Kind == ResourceKind.StructuredBufferReadWrite)
                 {
                     uint id = bufferIndex++;
@@ -530,10 +543,10 @@ internal static unsafe class LibVeldridSpirv
         if (info.Target == CrossCompileTarget.HLSL || info.Target == CrossCompileTarget.MSL)
         {
             ResourceCounter counter = new();
-            foreach (ResourceInfo it in allResources.Map.Values)
+            foreach (OwnedMap<BindingInfo, ResourceInfo>.Pair it in allResources)
             {
-                uint index = GetResourceIndex(info.Target, it.Kind, ref counter);
-                uint csID = it.IDs[0];
+                uint index = GetResourceIndex(info.Target, it.Value.Kind, ref counter);
+                uint csID = it.Value.IDs[0];
                 if (csID != 0)
                 {
                     api1.CompilerSetDecoration(csCompiler, csID, Decoration.Binding, index);
@@ -570,8 +583,10 @@ internal static unsafe class LibVeldridSpirv
 
             uint bufferIndex = 0;
             uint imageIndex = 0;
-            foreach (ResourceInfo it in allResources.Map.Values)
+            foreach (OwnedMap<BindingInfo, ResourceInfo>.Pair pair in allResources)
             {
+                ref ResourceInfo it = ref pair.Value;
+
                 // TODO: check if IDs is zero like elsewhere?
                 if (it.Kind == ResourceKind.StructuredBufferReadOnly || it.Kind == ResourceKind.StructuredBufferReadWrite)
                 {
